@@ -1,0 +1,8 @@
+# Requirements for statisticalDataVerifier.py
+# MongoDB Python driver for connecting to MongoDB/DocumentDB
+pymongo>=4.0.0
+
+# Standard library modules (included with Python):
+# - sys
+# - time 
+# - threading
