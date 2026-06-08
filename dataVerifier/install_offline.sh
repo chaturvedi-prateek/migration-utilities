@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Bootstrap pip if not available
 if ! python3 -m pip --version &>/dev/null; then
     echo "pip not found, bootstrapping from get-pip.py..."
-    python3 "$SCRIPT_DIR/get-pip.py" --no-index
+    python3 "$SCRIPT_DIR/get-pip.py" --no-index --find-links="$SCRIPT_DIR/packages"
     if [ $? -ne 0 ]; then
         echo "Failed to install pip. Try: python3 get-pip.py"
         exit 1
