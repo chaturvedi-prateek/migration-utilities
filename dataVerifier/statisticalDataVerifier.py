@@ -24,9 +24,14 @@ def compare_documents(documents, destination_documents):
 def get_sample_document_count(source_collection, max_number_docs):
     # Get the total count of documents
     total_count = source_collection.estimated_document_count({})
-    sample_doc_count = min(int(total_count * 0.05), int(max_number_docs))
-    print(f"Total count of documents in the source collection: {total_count}")
-    print(f"Total count of documents sampled (5%): {sample_doc_count}")
+    if int(max_number_docs) == 0:
+        sample_doc_count = int(total_count * 0.05)
+        print(f"Total count of documents in the source collection: {total_count}")
+        print(f"Total count of documents sampled (5%): {sample_doc_count}")
+    else:
+        sample_doc_count = min(int(max_number_docs), total_count)
+        print(f"Total count of documents in the source collection: {total_count}")
+        print(f"Total count of documents sampled: {sample_doc_count}")
     return sample_doc_count
 
 def get_sample_documents(source_collection, sample_doc_count):
