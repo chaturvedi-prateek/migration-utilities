@@ -14,13 +14,13 @@ const COLLECTIONS = [
     // { _id: ObjectId("...") } → extract inner ObjectId
     fixFn: (doc) => doc._id._id
   },
-  {
-    dbName:    "your-db",             // ← update with actual db name
-    collName:  "your-collection",     // ← update with actual collection name
-    wrongType: "object",
-    // { mobilenumber: 343566, did: 324432 } → generate a brand new ObjectId
-    fixFn: (doc) => new ObjectId()
-  }
+  // Add more entries as needed:
+  // {
+  //   dbName:    "your-db",
+  //   collName:  "your-collection",
+  //   wrongType: "object",
+  //   fixFn: (doc) => new ObjectId()   // compound object _id → new ObjectId
+  // }
 ];
 
 const DRY_RUN = true;   // ← set to false when ready to make changes
@@ -149,13 +149,19 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
     }
 
     // ── Step 3: Delete original wrong document ──
+    // Uses runCommand directly to avoid "retryable writes not supported" error on DocumentDB
     logStep(`${docLabel} [3/3] Deleting original wrong document _id: ${JSON.stringify(doc._id)}`);
     try {
-      const deleteResult = coll.deleteOne({ _id: doc._id });
-      if (deleteResult.deletedCount === 1) {
+      const deleteResult = currentDB.runCommand({
+        delete: collName,
+        deletes: [{ q: { _id: doc._id }, limit: 1 }]
+      });
+      if (deleteResult.ok && deleteResult.n === 1) {
         logOk(`${docLabel} [3/3] Delete successful`);
-      } else {
+      } else if (deleteResult.ok && deleteResult.n === 0) {
         logWarn(`${docLabel} [3/3] Delete matched 0 documents — document may have already been removed`);
+      } else {
+        throw new Error(JSON.stringify(deleteResult));
       }
     } catch (e) {
       logError(`${docLabel} [3/3] Delete FAILED. Error: ${e.message}`);
