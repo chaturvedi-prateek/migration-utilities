@@ -73,12 +73,10 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
 
   let totalFound = 0, fixed = 0, skipped = 0, errors = 0;
 
-  // ── Fetch wrong documents ─────────────────────────────────────
-  logStep(`Querying for documents with _id type "${wrongType}"...`);
-  let wrongDocs;
+  // ── Count wrong documents (avoids loading all into memory) ────
+  logStep(`Counting documents with _id type "${wrongType}"...`);
   try {
-    wrongDocs = coll.find({ _id: { $type: wrongType } }).toArray();
-    totalFound = wrongDocs.length;
+    totalFound = coll.countDocuments({ _id: { $type: wrongType } });
     logInfo(`Found ${totalFound} document(s) with wrong _id type`);
   } catch (e) {
     logError(`Failed to query collection ${ns}: ${e.message}`);
@@ -92,9 +90,13 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
     return;
   }
 
-  // ── Process each document ─────────────────────────────────────
-  wrongDocs.forEach((doc, docIdx) => {
-    const docLabel = `[doc ${docIdx + 1}/${totalFound}]`;
+  // ── Process via cursor (one document at a time) ───────────────
+  const cursor = coll.find({ _id: { $type: wrongType } });
+  let docIdx = 0;
+  while (cursor.hasNext()) {
+    const doc = cursor.next();
+    docIdx++;
+    const docLabel = `[doc ${docIdx}/${totalFound}]`;
     logInfo(`${docLabel} Processing _id : ${JSON.stringify(doc._id)}`);
 
     // ── Derive new _id ──
@@ -106,7 +108,7 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
     } catch (e) {
       logSkip(`${docLabel} Cannot derive new _id — ${e.message}`);
       skipped++;
-      return;
+      continue;
     }
 
     if (DRY_RUN) {
@@ -114,11 +116,12 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
       logDry(`${docLabel} Would insert  → ${ns}  with _id: ${newId}`);
       logDry(`${docLabel} Would delete  → ${ns}  old _id: ${JSON.stringify(doc._id)}`);
       fixed++;
-      return;
+      continue;
     }
 
     // ── Step 1: Backup ──
     logStep(`${docLabel} [1/3] Backing up original document to ${backupNs}`);
+    let backupFailed = false;
     try {
       backupColl.insertOne(doc);
       logOk(`${docLabel} [1/3] Backup successful`);
@@ -128,13 +131,15 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
       } else {
         logError(`${docLabel} [1/3] Backup FAILED — aborting this document. Error: ${e.message}`);
         errors++;
-        return;
+        backupFailed = true;
       }
     }
+    if (backupFailed) continue;
 
     // ── Step 2: Insert corrected document ──
     logStep(`${docLabel} [2/3] Inserting corrected document with _id: ${newId}`);
     const newDoc = Object.assign({}, doc, { _id: newId });
+    let insertFailed = false;
     try {
       coll.insertOne(newDoc);
       logOk(`${docLabel} [2/3] Insert successful`);
@@ -144,9 +149,10 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
       } else {
         logError(`${docLabel} [2/3] Insert FAILED — aborting this document to avoid data loss. Error: ${e.message}`);
         errors++;
-        return;
+        insertFailed = true;
       }
     }
+    if (insertFailed) continue;
 
     // ── Step 3: Delete original wrong document ──
     // Uses runCommand directly to avoid "retryable writes not supported" error on DocumentDB
@@ -166,12 +172,12 @@ COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
     } catch (e) {
       logError(`${docLabel} [3/3] Delete FAILED. Error: ${e.message}`);
       errors++;
-      return;
+      continue;
     }
 
     logOk(`${docLabel} Fix complete : ${JSON.stringify(doc._id)} → ${newId}`);
     fixed++;
-  });
+  }
 
   // ── Collection summary ────────────────────────────────────────
   const colElapsed = ((new Date() - colStart) / 1000).toFixed(1);
