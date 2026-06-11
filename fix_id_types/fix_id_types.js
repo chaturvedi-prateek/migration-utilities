@@ -4,13 +4,22 @@ const COLLECTIONS = [
     dbName:    "common-warranty-db",
     collName:  "vm_warranty_approval_online",
     wrongType: "string",
+    // string "6374c4de..." → ObjectId("6374c4de...")
     fixFn: (doc) => ObjectId(doc._id)
   },
   {
     dbName:    "svoi-db",             // ← update with actual db name
     collName:  "consumer_did_mapping_log",
     wrongType: "object",
+    // { _id: ObjectId("...") } → extract inner ObjectId
     fixFn: (doc) => doc._id._id
+  },
+  {
+    dbName:    "your-db",             // ← update with actual db name
+    collName:  "your-collection",     // ← update with actual collection name
+    wrongType: "object",
+    // { mobilenumber: 343566, did: 324432 } → generate a brand new ObjectId
+    fixFn: (doc) => new ObjectId()
   }
 ];
 

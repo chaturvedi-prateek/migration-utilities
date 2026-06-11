@@ -22,6 +22,7 @@ wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 |---|---|---|
 | `string` | `"6374c4debb4e876fe62a36af"` | Converts string to `ObjectId` |
 | `object` (nested) | `{ "_id": ObjectId("...") }` | Extracts inner `ObjectId` |
+| `object` (compound) | `{ mobilenumber: 343566, did: 324432 }` | Generates a brand new `ObjectId` |
 
 ---
 
@@ -44,16 +45,23 @@ const COLLECTIONS = [
     collName:  "another-collection",
     wrongType: "object",
     fixFn: (doc) => doc._id._id            // for nested { _id: ObjectId(...) } pattern
+  },
+  {
+    dbName:    "another-database",
+    collName:  "another-collection",
+    wrongType: "object",
+    fixFn: (doc) => new ObjectId()         // for compound object { mobilenumber: 343566, did: 324432 }
   }
 ];
 ```
 
 **`fixFn` reference:**
 
-| Wrong `_id` | `fixFn` |
-|---|---|
-| String that looks like an ObjectId | `(doc) => ObjectId(doc._id)` |
-| Nested object `{ _id: ObjectId(...) }` | `(doc) => doc._id._id` |
+| Wrong `_id` | Example | `fixFn` |
+|---|---|---|
+| String that looks like an ObjectId | `"6374c4debb4e876fe62a36af"` | `(doc) => ObjectId(doc._id)` |
+| Nested object with inner `_id` field | `{ _id: ObjectId("...") }` | `(doc) => doc._id._id` |
+| Compound object with no embedded ObjectId | `{ mobilenumber: 343566, did: 324432 }` | `(doc) => new ObjectId()` |
 
 ### 2. `DRY_RUN` flag
 
