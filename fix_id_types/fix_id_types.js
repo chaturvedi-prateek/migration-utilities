@@ -8,7 +8,7 @@ const COLLECTIONS = [
     fixFn: (doc) => ObjectId(doc._id)
   },
   {
-    dbName:    "svoi-db",             // ← update with actual db name
+    dbName:    "svoi-db",
     collName:  "consumer_did_mapping_log",
     wrongType: "object",
     // { _id: ObjectId("...") } → extract inner ObjectId
@@ -23,17 +23,15 @@ const COLLECTIONS = [
   // }
 ];
 
-const DRY_RUN = true;   // ← set to false when ready to make changes
+const DRY_RUN    = true;   // ← set to false when ready to make changes
+const BATCH_SIZE = 200;    // docs per round-trip    // docs per round-trip
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SEPARATOR  = "═".repeat(60);
 const SEPARATOR2 = "─".repeat(60);
 
 function ts() { return new Date().toISOString(); }
-
-function log(level, msg) {
-  print(`[${ts()}] [${level}] ${msg}`);
-}
+function log(level, msg) { print(`[${ts()}] [${level}] ${msg}`); }
 
 function logInfo  (msg) { log("INFO ", msg); }
 function logOk    (msg) { log("OK   ", msg); }
@@ -45,166 +43,208 @@ function logStep  (msg) { log("STEP ", msg); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const runStart = new Date();
-
-print(SEPARATOR);
-logInfo(`Script start`);
-logInfo(`Mode     : ${DRY_RUN ? "DRY RUN (no changes will be made)" : "LIVE (changes WILL be applied)"}`);
-logInfo(`Collections to process : ${COLLECTIONS.length}`);
-COLLECTIONS.forEach((c, i) =>
-  logInfo(`  [${i + 1}] ${c.dbName}.${c.collName}  (wrongType: ${c.wrongType})`)
-);
-print(SEPARATOR);
-
-const globalSummary = [];
-
-COLLECTIONS.forEach(({ dbName, collName, wrongType, fixFn }, colIdx) => {
+// Phase 1 — stream all wrong-type docs into the backup collection in batches.
+// No count query; progress logged after each batch.
+async function backupCollection({ dbName, collName, wrongType }, colIdx) {
   const ns         = `${dbName}.${collName}`;
-  const backupNs   = `${dbName}.${collName}_id_fix_backup`;
+  const backupNs   = `${ns}_id_fix_backup`;
   const currentDB  = db.getSiblingDB(dbName);
   const coll       = currentDB[collName];
   const backupColl = currentDB[`${collName}_id_fix_backup`];
 
-  const colStart = new Date();
-  print(SEPARATOR2);
-  logInfo(`[${colIdx + 1}/${COLLECTIONS.length}] Starting collection : ${ns}`);
-  logInfo(`Backup collection    : ${backupNs}`);
-  logInfo(`Wrong _id type       : ${wrongType}`);
+  logInfo(`[BACKUP ${colIdx + 1}/${COLLECTIONS.length}] ${ns} → ${backupNs}`);
 
-  let totalFound = 0, fixed = 0, skipped = 0, errors = 0;
-
-  // ── Count wrong documents (avoids loading all into memory) ────
-  logStep(`Counting documents with _id type "${wrongType}"...`);
-  try {
-    totalFound = coll.countDocuments({ _id: { $type: wrongType } });
-    logInfo(`Found ${totalFound} document(s) with wrong _id type`);
-  } catch (e) {
-    logError(`Failed to query collection ${ns}: ${e.message}`);
-    globalSummary.push({ ns, totalFound: "QUERY FAILED", fixed: 0, skipped: 0, errors: 1 });
-    return;
-  }
-
-  if (totalFound === 0) {
-    logOk(`No documents to fix in ${ns}`);
-    globalSummary.push({ ns, totalFound: 0, fixed: 0, skipped: 0, errors: 0 });
-    return;
-  }
-
-  // ── Process via cursor (one document at a time) ───────────────
+  let backed = 0, dupes = 0, errors = 0;
   const cursor = coll.find({ _id: { $type: wrongType } });
-  let docIdx = 0;
-  while (cursor.hasNext()) {
-    const doc = cursor.next();
-    docIdx++;
-    const docLabel = `[doc ${docIdx}/${totalFound}]`;
-    logInfo(`${docLabel} Processing _id : ${JSON.stringify(doc._id)}`);
 
-    // ── Derive new _id ──
-    let newId;
-    try {
-      newId = fixFn(doc);
-      if (newId === null || newId === undefined) throw new Error("fixFn returned null/undefined");
-      logInfo(`${docLabel} Derived new _id : ${newId}`);
-    } catch (e) {
-      logSkip(`${docLabel} Cannot derive new _id — ${e.message}`);
-      skipped++;
-      continue;
+  while (cursor.hasNext()) {
+    const batch = [];
+    while (batch.length < BATCH_SIZE && cursor.hasNext()) {
+      batch.push(cursor.next());
     }
 
     if (DRY_RUN) {
-      logDry(`${docLabel} Would backup  → ${backupNs}`);
-      logDry(`${docLabel} Would insert  → ${ns}  with _id: ${newId}`);
-      logDry(`${docLabel} Would delete  → ${ns}  old _id: ${JSON.stringify(doc._id)}`);
-      fixed++;
+      batch.forEach(doc => logDry(`[${ns}] Would backup _id: ${JSON.stringify(doc._id)}`));
+      backed += batch.length;
+      logInfo(`[${ns}] Dry-run backup progress: ${backed} docs`);
       continue;
     }
 
-    // ── Step 1: Backup ──
-    logStep(`${docLabel} [1/3] Backing up original document to ${backupNs}`);
-    let backupFailed = false;
     try {
-      backupColl.insertOne(doc);
-      logOk(`${docLabel} [1/3] Backup successful`);
+      backupColl.insertMany(batch, { ordered: false });
+      backed += batch.length;
     } catch (e) {
-      if (e.code === 11000) {
-        logWarn(`${docLabel} [1/3] Backup already exists (duplicate key) — continuing`);
+      if (e.writeErrors) {
+        e.writeErrors.forEach(we => {
+          if (we.code === 11000) {
+            dupes++;
+          } else {
+            logError(`[${ns}] Backup FAILED at batch index ${we.index}: ${we.errmsg}`);
+            errors++;
+          }
+        });
+        backed += batch.length - errors;
+        if (dupes > 0) logWarn(`[${ns}] ${dupes} docs already in backup — skipped`);
       } else {
-        logError(`${docLabel} [1/3] Backup FAILED — aborting this document. Error: ${e.message}`);
-        errors++;
-        backupFailed = true;
+        logError(`[${ns}] Backup batch FAILED entirely: ${e.message}`);
+        errors += batch.length;
       }
     }
-    if (backupFailed) continue;
 
-    // ── Step 2: Insert corrected document ──
-    logStep(`${docLabel} [2/3] Inserting corrected document with _id: ${newId}`);
-    const newDoc = Object.assign({}, doc, { _id: newId });
-    let insertFailed = false;
+    logInfo(`[${ns}] Backed up ${backed} docs so far...`);
+  }
+
+  if (backed === 0 && dupes === 0 && errors === 0) {
+    logOk(`[${ns}] No documents with wrong _id type found — nothing to backup`);
+  } else {
+    logOk(`[${ns}] Backup done: ${backed} backed up, ${dupes} already existed, ${errors} errors`);
+  }
+
+  return { ns, backed, dupes, errors };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Phase 2 — read from backup collection, insert corrected docs, delete originals.
+// Using the backup collection as source ensures we only touch docs that are backed up.
+async function fixCollection({ dbName, collName, fixFn }, colIdx) {
+  const ns        = `${dbName}.${collName}`;
+  const currentDB = db.getSiblingDB(dbName);
+  const coll      = currentDB[collName];
+  const backupColl = currentDB[`${collName}_id_fix_backup`];
+
+  logInfo(`[FIX ${colIdx + 1}/${COLLECTIONS.length}] ${ns}`);
+
+  let fixed = 0, skipped = 0, errors = 0;
+  const cursor = backupColl.find();
+
+  while (cursor.hasNext()) {
+    const batch = [];
+    while (batch.length < BATCH_SIZE && cursor.hasNext()) {
+      batch.push(cursor.next());
+    }
+
+    if (DRY_RUN) {
+      batch.forEach(doc => {
+        try {
+          const newId = fixFn(doc);
+          if (newId === null || newId === undefined) throw new Error("fixFn returned null/undefined");
+          logDry(`[${ns}] Would fix: ${JSON.stringify(doc._id)} → ${newId}`);
+          fixed++;
+        } catch (e) {
+          logSkip(`[${ns}] _id ${JSON.stringify(doc._id)}: ${e.message}`);
+          skipped++;
+        }
+      });
+      continue;
+    }
+
+    // ── Derive new IDs (skip docs where fixFn fails) ──────────────
+    const valid = [];
+    batch.forEach(doc => {
+      try {
+        const newId = fixFn(doc);
+        if (newId === null || newId === undefined) throw new Error("fixFn returned null/undefined");
+        valid.push({ doc, newId });
+      } catch (e) {
+        logSkip(`[${ns}] _id ${JSON.stringify(doc._id)}: ${e.message}`);
+        skipped++;
+      }
+    });
+
+    if (valid.length === 0) continue;
+
+    // ── Step 1: Insert corrected docs ─────────────────────────────
+    const failedInsert = new Set();
     try {
-      coll.insertOne(newDoc);
-      logOk(`${docLabel} [2/3] Insert successful`);
+      coll.insertMany(valid.map(v => Object.assign({}, v.doc, { _id: v.newId })), { ordered: false });
     } catch (e) {
-      if (e.code === 11000) {
-        logWarn(`${docLabel} [2/3] Correct _id already exists — will still delete wrong doc`);
+      if (e.writeErrors) {
+        e.writeErrors.forEach(we => {
+          if (we.code === 11000) {
+            logWarn(`[${ns}] Insert dup at batch index ${we.index} — already inserted, will still delete`);
+          } else {
+            logError(`[${ns}] Insert FAILED at batch index ${we.index}: ${we.errmsg}`);
+            failedInsert.add(we.index);
+            errors++;
+          }
+        });
       } else {
-        logError(`${docLabel} [2/3] Insert FAILED — aborting this document to avoid data loss. Error: ${e.message}`);
-        errors++;
-        insertFailed = true;
+        logError(`[${ns}] Insert batch FAILED entirely: ${e.message}`);
+        errors += valid.length;
+        continue;
       }
     }
-    if (insertFailed) continue;
 
-    // ── Step 3: Delete original wrong document ──
-    // Uses runCommand directly to avoid "retryable writes not supported" error on DocumentDB
-    logStep(`${docLabel} [3/3] Deleting original wrong document _id: ${JSON.stringify(doc._id)}`);
+    // ── Step 2: Batch delete originals ────────────────────────────
+    // runCommand avoids "retryable writes not supported" error on DocumentDB
+    const toDelete = valid.filter((_, i) => !failedInsert.has(i));
     try {
       const deleteResult = currentDB.runCommand({
         delete: collName,
-        deletes: [{ q: { _id: doc._id }, limit: 1 }]
+        deletes: toDelete.map(v => ({ q: { _id: v.doc._id }, limit: 1 }))
       });
-      if (deleteResult.ok && deleteResult.n === 1) {
-        logOk(`${docLabel} [3/3] Delete successful`);
-      } else if (deleteResult.ok && deleteResult.n === 0) {
-        logWarn(`${docLabel} [3/3] Delete matched 0 documents — document may have already been removed`);
+      if (deleteResult.ok) {
+        (deleteResult.writeErrors || []).forEach(we =>
+          logError(`[${ns}] Delete failed at batch index ${we.index}: ${we.errmsg}`)
+        );
+        errors += (deleteResult.writeErrors || []).length;
+        fixed  += (deleteResult.n || 0);
       } else {
         throw new Error(JSON.stringify(deleteResult));
       }
     } catch (e) {
-      logError(`${docLabel} [3/3] Delete FAILED. Error: ${e.message}`);
-      errors++;
-      continue;
+      logError(`[${ns}] Delete batch FAILED: ${e.message}`);
+      errors += toDelete.length;
     }
 
-    logOk(`${docLabel} Fix complete : ${JSON.stringify(doc._id)} → ${newId}`);
-    fixed++;
+    logInfo(`[${ns}] Fixed ${fixed} docs so far...`);
   }
 
-  // ── Collection summary ────────────────────────────────────────
-  const colElapsed = ((new Date() - colStart) / 1000).toFixed(1);
+  logOk(`[${ns}] Fix done: ${fixed} fixed, ${skipped} skipped, ${errors} errors`);
+  return { ns, fixed, skipped, errors };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+(async () => {
+  const runStart = new Date();
+  print(SEPARATOR);
+  logInfo(`Script start`);
+  logInfo(`Mode       : ${DRY_RUN ? "DRY RUN (no changes will be made)" : "LIVE (changes WILL be applied)"}`);
+  logInfo(`Batch size : ${BATCH_SIZE}`);
+  logInfo(`Collections: ${COLLECTIONS.length}`);
+  COLLECTIONS.forEach((c, i) =>
+    logInfo(`  [${i + 1}] ${c.dbName}.${c.collName}  (wrongType: ${c.wrongType})`)
+  );
+
+  // ── Phase 1: Backup all collections in parallel ───────────────
+  print(SEPARATOR);
+  logInfo(`PHASE 1 — BACKUP ALL COLLECTIONS`);
   print(SEPARATOR2);
-  logInfo(`Collection summary : ${ns}`);
-  logInfo(`  Total found  : ${totalFound}`);
-  logInfo(`  Fixed        : ${fixed}`);
-  logInfo(`  Skipped      : ${skipped}`);
-  logInfo(`  Errors       : ${errors}`);
-  logInfo(`  Elapsed      : ${colElapsed}s`);
-  if (!DRY_RUN && fixed > 0)
-    logInfo(`  Backup at    : ${backupNs}`);
+  const backupResults = await Promise.all(COLLECTIONS.map((c, i) => backupCollection(c, i)));
 
-  globalSummary.push({ ns, totalFound, fixed, skipped, errors });
-});
+  // ── Phase 2: Insert + delete all collections in parallel ──────
+  print(SEPARATOR);
+  logInfo(`PHASE 2 — INSERT CORRECTED + DELETE ORIGINALS`);
+  print(SEPARATOR2);
+  const fixResults = await Promise.all(COLLECTIONS.map((c, i) => fixCollection(c, i)));
 
-// ── Global summary ────────────────────────────────────────────────────────────
-const totalElapsed = ((new Date() - runStart) / 1000).toFixed(1);
-print(SEPARATOR);
-logInfo(`GLOBAL SUMMARY`);
-logInfo(SEPARATOR2);
-globalSummary.forEach(s => {
-  logInfo(`${s.ns}`);
-  logInfo(`  Found: ${s.totalFound}  Fixed: ${s.fixed}  Skipped: ${s.skipped}  Errors: ${s.errors}`);
-});
-print(SEPARATOR2);
-logInfo(`Total elapsed : ${totalElapsed}s`);
-logInfo(`Mode          : ${DRY_RUN ? "DRY RUN — no changes were made" : "LIVE — changes applied"}`);
-logInfo(`Script end`);
-print(SEPARATOR);
+  // ── Global summary ─────────────────────────────────────────────
+  const totalElapsed = ((new Date() - runStart) / 1000).toFixed(1);
+  print(SEPARATOR);
+  logInfo(`GLOBAL SUMMARY`);
+  logInfo(SEPARATOR2);
+  COLLECTIONS.forEach((c, i) => {
+    const ns = `${c.dbName}.${c.collName}`;
+    const b  = backupResults[i];
+    const f  = fixResults[i];
+    logInfo(`${ns}`);
+    logInfo(`  Backup : ${b.backed} backed up, ${b.dupes} already existed, ${b.errors} errors`);
+    logInfo(`  Fix    : ${f.fixed} fixed, ${f.skipped} skipped, ${f.errors} errors`);
+  });
+  print(SEPARATOR2);
+  logInfo(`Total elapsed : ${totalElapsed}s`);
+  logInfo(`Mode          : ${DRY_RUN ? "DRY RUN — no changes were made" : "LIVE — changes applied"}`);
+  logInfo(`Script end`);
+  print(SEPARATOR);
+})();
