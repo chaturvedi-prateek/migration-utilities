@@ -23,8 +23,9 @@ const COLLECTIONS = [
   // }
 ];
 
-const DRY_RUN    = true;   // ← set to false when ready to make changes
-const BATCH_SIZE = 200;    // docs per round-trip    // docs per round-trip
+const DRY_RUN    = true;    // ← set to false when ready to make changes
+const BATCH_SIZE = 500;     // docs per round-trip; lower if documents are very large (>32 KB each)
+const LOG_EVERY  = 10_000;  // print a progress line after every N documents processed
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SEPARATOR  = "═".repeat(60);
@@ -41,10 +42,17 @@ function logError (msg) { log("ERROR", msg); }
 function logDry   (msg) { log("DRY  ", msg); }
 function logStep  (msg) { log("STEP ", msg); }
 
+// Returns a cursor with timeout disabled and server-side prefetch aligned to BATCH_SIZE.
+// noCursorTimeout prevents expiry during long-running batch operations (critical for
+// collections where scanning 1 M+ docs takes more than the default 10-minute idle timeout).
+function openCursor(coll, query) {
+  return coll.find(query).batchSize(BATCH_SIZE).noCursorTimeout();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Phase 1 — stream all wrong-type docs into the backup collection in batches.
-// No count query; progress logged after each batch.
+// Progress is printed every LOG_EVERY docs, not every batch, to keep logs readable.
 async function backupCollection({ dbName, collName, wrongType }, colIdx) {
   const ns         = `${dbName}.${collName}`;
   const backupNs   = `${ns}_id_fix_backup`;
@@ -54,8 +62,8 @@ async function backupCollection({ dbName, collName, wrongType }, colIdx) {
 
   logInfo(`[BACKUP ${colIdx + 1}/${COLLECTIONS.length}] ${ns} → ${backupNs}`);
 
-  let backed = 0, dupes = 0, errors = 0;
-  const cursor = coll.find({ _id: { $type: wrongType } });
+  let backed = 0, dupes = 0, errors = 0, lastLogAt = 0;
+  const cursor = openCursor(coll, { _id: { $type: wrongType } });
 
   while (cursor.hasNext()) {
     const batch = [];
@@ -64,9 +72,11 @@ async function backupCollection({ dbName, collName, wrongType }, colIdx) {
     }
 
     if (DRY_RUN) {
-      batch.forEach(doc => logDry(`[${ns}] Would backup _id: ${JSON.stringify(doc._id)}`));
       backed += batch.length;
-      logInfo(`[${ns}] Dry-run backup progress: ${backed} docs`);
+      if (backed - lastLogAt >= LOG_EVERY) {
+        logDry(`[${ns}] Would backup ${backed} docs so far...`);
+        lastLogAt = backed;
+      }
       continue;
     }
 
@@ -75,24 +85,28 @@ async function backupCollection({ dbName, collName, wrongType }, colIdx) {
       backed += batch.length;
     } catch (e) {
       if (e.writeErrors) {
-        e.writeErrors.forEach(we => {
-          if (we.code === 11000) {
-            dupes++;
-          } else {
-            logError(`[${ns}] Backup FAILED at batch index ${we.index}: ${we.errmsg}`);
-            errors++;
-          }
-        });
-        backed += batch.length - errors;
-        if (dupes > 0) logWarn(`[${ns}] ${dupes} docs already in backup — skipped`);
+        const batchDupes  = e.writeErrors.filter(we => we.code === 11000).length;
+        const batchErrors = e.writeErrors.filter(we => we.code !== 11000);
+        dupes  += batchDupes;
+        errors += batchErrors.length;
+        backed += batch.length - batchErrors.length;
+        batchErrors.forEach(we =>
+          logError(`[${ns}] Backup FAILED at batch index ${we.index}: ${we.errmsg}`)
+        );
+        if (batchDupes > 0) logWarn(`[${ns}] ${batchDupes} docs in this batch already backed up — skipped`);
       } else {
         logError(`[${ns}] Backup batch FAILED entirely: ${e.message}`);
         errors += batch.length;
       }
     }
 
-    logInfo(`[${ns}] Backed up ${backed} docs so far...`);
+    if (backed - lastLogAt >= LOG_EVERY) {
+      logInfo(`[${ns}] Backed up ${backed} docs so far...`);
+      lastLogAt = backed;
+    }
   }
+
+  cursor.close();
 
   if (backed === 0 && dupes === 0 && errors === 0) {
     logOk(`[${ns}] No documents with wrong _id type found — nothing to backup`);
@@ -106,36 +120,40 @@ async function backupCollection({ dbName, collName, wrongType }, colIdx) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Phase 2 — read from backup collection, insert corrected docs, delete originals.
-// Using the backup collection as source ensures we only touch docs that are backed up.
+// Using backup as source guarantees we only touch docs that were safely backed up.
 async function fixCollection({ dbName, collName, fixFn }, colIdx) {
-  const ns        = `${dbName}.${collName}`;
-  const currentDB = db.getSiblingDB(dbName);
-  const coll      = currentDB[collName];
+  const ns         = `${dbName}.${collName}`;
+  const currentDB  = db.getSiblingDB(dbName);
+  const coll       = currentDB[collName];
   const backupColl = currentDB[`${collName}_id_fix_backup`];
 
   logInfo(`[FIX ${colIdx + 1}/${COLLECTIONS.length}] ${ns}`);
 
-  let fixed = 0, skipped = 0, errors = 0;
-  const cursor = backupColl.find();
+  let fixed = 0, skipped = 0, errors = 0, processed = 0, lastLogAt = 0;
+  const cursor = openCursor(backupColl, {});
 
   while (cursor.hasNext()) {
     const batch = [];
     while (batch.length < BATCH_SIZE && cursor.hasNext()) {
       batch.push(cursor.next());
     }
+    processed += batch.length;
 
     if (DRY_RUN) {
       batch.forEach(doc => {
         try {
           const newId = fixFn(doc);
           if (newId === null || newId === undefined) throw new Error("fixFn returned null/undefined");
-          logDry(`[${ns}] Would fix: ${JSON.stringify(doc._id)} → ${newId}`);
           fixed++;
         } catch (e) {
           logSkip(`[${ns}] _id ${JSON.stringify(doc._id)}: ${e.message}`);
           skipped++;
         }
       });
+      if (processed - lastLogAt >= LOG_EVERY) {
+        logDry(`[${ns}] Would fix ${fixed} docs so far (${skipped} skipped)...`);
+        lastLogAt = processed;
+      }
       continue;
     }
 
@@ -162,7 +180,7 @@ async function fixCollection({ dbName, collName, fixFn }, colIdx) {
       if (e.writeErrors) {
         e.writeErrors.forEach(we => {
           if (we.code === 11000) {
-            logWarn(`[${ns}] Insert dup at batch index ${we.index} — already inserted, will still delete`);
+            // already inserted on a previous run — still proceed to delete the original
           } else {
             logError(`[${ns}] Insert FAILED at batch index ${we.index}: ${we.errmsg}`);
             failedInsert.add(we.index);
@@ -198,8 +216,13 @@ async function fixCollection({ dbName, collName, fixFn }, colIdx) {
       errors += toDelete.length;
     }
 
-    logInfo(`[${ns}] Fixed ${fixed} docs so far...`);
+    if (processed - lastLogAt >= LOG_EVERY) {
+      logInfo(`[${ns}] Fixed ${fixed} docs so far (${skipped} skipped, ${errors} errors)...`);
+      lastLogAt = processed;
+    }
   }
+
+  cursor.close();
 
   logOk(`[${ns}] Fix done: ${fixed} fixed, ${skipped} skipped, ${errors} errors`);
   return { ns, fixed, skipped, errors };
@@ -211,7 +234,8 @@ async function fixCollection({ dbName, collName, fixFn }, colIdx) {
   print(SEPARATOR);
   logInfo(`Script start`);
   logInfo(`Mode       : ${DRY_RUN ? "DRY RUN (no changes will be made)" : "LIVE (changes WILL be applied)"}`);
-  logInfo(`Batch size : ${BATCH_SIZE}`);
+  logInfo(`Batch size : ${BATCH_SIZE} docs/round-trip`);
+  logInfo(`Log every  : ${LOG_EVERY} docs`);
   logInfo(`Collections: ${COLLECTIONS.length}`);
   COLLECTIONS.forEach((c, i) =>
     logInfo(`  [${i + 1}] ${c.dbName}.${c.collName}  (wrongType: ${c.wrongType})`)
