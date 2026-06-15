@@ -1,54 +1,69 @@
-# How to 
+# Index Script Generation and Execution
 
-## What is it
+## What this folder does
 
-- Capture all output from the Python script (including stderr)
-- Grep for the three specific error patterns:
-  - "does not match for document" (field value mismatch)
-  - "does not exist in document" (missing field)
-  - "does not exist in the destination collection" (missing document)
-- Stop on discrepancies: As soon as any data discrepancy is detected, the script will:
-  - Display the discrepancies found
-     - Show a clear "STOPPING EXECUTION" message
-     - Display which iteration the discrepancy was found in
-     - Exit with code 1
-  - Stop on script failures: If the Python script itself fails (non-zero exit code), the script will:
-     - Show the failure message
-     - Display which iteration failed
-     - Exit with the same exit code as the Python script
-- Sample behavior:
-  - If discrepancies are found:
+The script [createIndexDefinition.js](createIndexDefinition.js) connects to the current MongoDB shell context and generates two scripts:
 
-```log
-  --- Iteration 3/100 ---
-...normal output...
+1. `createIndexesAtDestination.js` (pre-cutover)
+- Creates indexes on destination.
+- Forces TTL indexes to `expireAfterSeconds: 2147483647`.
+- Creates originally unique indexes as non-unique (`unique: false`).
 
-*** DATA DISCREPANCIES FOUND IN ITERATION 3 ***
-Field 'status' does not match for document with _id '507f1f77bcf86cd799439011'
-*** END OF DISCREPANCIES ***
+2. `postCutoverRectifyIndexes.js` (post-cutover)
+- Restores unique indexes using `collMod` with:
+  - `prepareUnique: true`
+  - then `unique: true`
+- Restores original TTL values using `collMod` with original `expireAfterSeconds`.
 
-STOPPING EXECUTION DUE TO DATA DISCREPANCIES!
-Discrepancies found at iteration 3 of 100
-Stopped at: Mon Oct 14 10:45:32 UTC 2025
-``` 
+## Prerequisites
 
-  - If all iterations pass without discrepancies:
+1. `mongosh` installed and accessible in PATH.
+2. Connectivity and permissions to:
+- list databases
+- list collections
+- read indexes
+- run `createIndex` and `collMod`
 
-```log
-...all iterations complete...
-All 100 iterations completed!
-Finished at: Mon Oct 14 11:30:15 UTC 2025
-```
+## Step 1: Generate both output scripts
 
-## Usage
+Run from the `indexes` folder while connected to the source cluster:
 
 ```bash
-# Run 10 times with default parameters
-./run_verifier_custom.sh
-
-# Run 5 times with custom parameters
-./run_verifier_custom.sh 5 samquote tasks 3000
-
-# Run 15 times with different collection
-./run_verifier_custom.sh 15 samquote quotes 5000
+mongosh "<SOURCE_CONNECTION_STRING>" --file createIndexDefinition.js
 ```
+
+This produces:
+
+1. `createIndexesAtDestination.js`
+2. `postCutoverRectifyIndexes.js`
+
+## Step 2: Run pre-cutover index creation on destination
+
+Run against the destination cluster before cutover:
+
+```bash
+mongosh "<DESTINATION_CONNECTION_STRING>" --file createIndexesAtDestination.js
+```
+
+## Step 3: Run post-cutover rectification on destination
+
+After cutover, run:
+
+```bash
+mongosh "<DESTINATION_CONNECTION_STRING>" --file postCutoverRectifyIndexes.js
+```
+
+This re-enables uniqueness and restores original TTL values.
+
+## Recommended validation
+
+After each step, validate index state on critical collections:
+
+```javascript
+db.getSiblingDB("<dbName>").getCollection("<collectionName>").getIndexes()
+```
+
+## Notes
+
+1. The generator skips the `_id_` index.
+2. If duplicate data exists post-cutover, `prepareUnique/unique` may fail for affected indexes. Resolve duplicates and rerun the post-cutover script.
