@@ -20,7 +20,14 @@ import os
 import struct
 import sys
 
-import bson
+try:
+    import bson
+    if not hasattr(bson, 'decode'):
+        raise ImportError
+except ImportError:
+    print("ERROR: Wrong or missing bson package.")
+    print("  Fix: pip uninstall bson && pip install pymongo")
+    sys.exit(1)
 
 
 def read_entries(dump_path):
