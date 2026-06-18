@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -17,43 +19,43 @@ type namespace struct {
 	col string
 }
 
-var namespaces = []namespace{
-	{"dms-trv-db", "st_tv_stock_log"},
-	{"dms-trv-db", "sh_tv_stock"},
-	{"ebook-delegate-db", "token"},
-	{"ebook-usersession-db", "usersession"},
-	{"svoc-db", "sync_job_log"},
+// config is the structure of the JSON config file.
+type config struct {
+	SourceURI      string   `json:"source_uri"`
+	DestinationURI string   `json:"destination_uri"`
+	Namespaces     []string `json:"namespaces"`
 }
 
 const batchSize = 500
 
 func main() {
+	configFile := flag.String("config", "config.json", "Path to JSON config file")
 	dryRun := flag.Bool("dry-run", true, "Print what would be done without applying changes (default: true)")
 	flag.Parse()
 
-	srcURI := os.Getenv("DOCDB_SRC")
-	dstURI := os.Getenv("MDB_DEST")
-
-	if srcURI == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: DOCDB_SRC environment variable not set")
+	cfg, err := loadConfig(*configFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
-	if dstURI == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: MDB_DEST environment variable not set")
+
+	namespaces, err := parseNamespaces(cfg.Namespaces)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
-	srcClient, err := mongo.Connect(ctx, options.Client().ApplyURI(srcURI))
+	srcClient, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.SourceURI))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: cannot connect to source: %v\n", err)
 		os.Exit(1)
 	}
 	defer srcClient.Disconnect(ctx)
 
-	dstClient, err := mongo.Connect(ctx, options.Client().ApplyURI(dstURI))
+	dstClient, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.DestinationURI))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: cannot connect to destination: %v\n", err)
 		os.Exit(1)
@@ -64,7 +66,8 @@ func main() {
 	if *dryRun {
 		mode = "DRY RUN — no changes will be written"
 	}
-	fmt.Printf("\n%s\n  copy-missing-docs  |  %s\n%s\n", line(60), mode, line(60))
+	fmt.Printf("\n%s\n  copy-missing-docs  |  %s\n  Config: %s  |  Namespaces: %d\n%s\n",
+		line(60), mode, *configFile, len(namespaces), line(60))
 
 	totalInserted, totalDeleted, totalErrors := 0, 0, 0
 
@@ -81,6 +84,41 @@ func main() {
 	if *dryRun {
 		fmt.Println("\n  Re-run with --dry-run=false to apply changes.")
 	}
+}
+
+func loadConfig(path string) (*config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open config file %q: %w", path, err)
+	}
+	defer f.Close()
+
+	var cfg config
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("cannot parse config file %q: %w", path, err)
+	}
+	if cfg.SourceURI == "" {
+		return nil, fmt.Errorf("config: source_uri is required")
+	}
+	if cfg.DestinationURI == "" {
+		return nil, fmt.Errorf("config: destination_uri is required")
+	}
+	if len(cfg.Namespaces) == 0 {
+		return nil, fmt.Errorf("config: namespaces list is empty")
+	}
+	return &cfg, nil
+}
+
+func parseNamespaces(raw []string) ([]namespace, error) {
+	out := make([]namespace, 0, len(raw))
+	for _, entry := range raw {
+		parts := strings.SplitN(entry, ".", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid namespace %q — must be in db.collection format", entry)
+		}
+		out = append(out, namespace{db: parts[0], col: parts[1]})
+	}
+	return out, nil
 }
 
 func syncCollection(ctx context.Context, srcClient, dstClient *mongo.Client, ns namespace, dryRun bool) (inserted, deleted, errors int) {
