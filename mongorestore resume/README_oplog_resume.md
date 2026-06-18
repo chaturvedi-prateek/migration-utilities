@@ -4,17 +4,6 @@ Resume a `mongorestore --oplogReplay` that stopped midway, using only the existi
 
 ---
 
-## Files to Share with Customer
-
-| File | Where it runs | Purpose |
-|------|--------------|---------|
-| `oplog_resume_local.py` | Local machine | Reads the dump, generates the mongosh query script, filters the dump |
-| `README_oplog_resume.md` | — | This guide |
-
-> `find_resume.js` is **generated automatically** by the script — do not share it separately.
-
----
-
 ## Prerequisites
 
 ### Local machine
