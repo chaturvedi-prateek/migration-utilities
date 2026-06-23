@@ -1,25 +1,27 @@
 # copy-missing-docs
 
-Copies documents that exist in the source (AWS DocumentDB) but are missing from the destination (MongoDB Atlas), and deletes documents from the destination that have been deleted from the source.
+Syncs missing documents from a source (AWS DocumentDB) to a destination (MongoDB Atlas) by comparing `_id` sets per collection. Also removes documents from the destination that were deleted from the source.
 
 Driven entirely by a JSON config file — no code changes needed to target different collections or clusters.
 
-## Binaries
+---
 
-| File | Platform |
+## Files
+
+| File | Description |
 |---|---|
-| `copy-missing-docs-linux-amd64` | Linux x86-64 (EC2, Ubuntu, RHEL, Amazon Linux) |
-| `copy-missing-docs-windows-amd64.exe` | Windows x86-64 |
+| `copy-missing-docs-linux-amd64` | Linux x86-64 binary |
+| `copy-missing-docs-windows-amd64.exe` | Windows x86-64 binary |
+| `config.sample.json` | Config template — copy and fill in your values |
+| `main.go` | Source code |
 
 No installation required. No Python. No pip. No runtime dependencies.
 
 ---
 
-## Quick Start
+## Setup
 
-### 1. Create a config file
-
-Copy the sample and fill in your values:
+### 1. Create your config file
 
 ```bash
 cp config.sample.json config.json
@@ -32,21 +34,28 @@ Edit `config.json`:
   "source_uri": "mongodb://username:password@docdb-endpoint:27017/?tls=true&tlsCAFile=/path/to/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred",
   "destination_uri": "mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority",
   "namespaces": [
-    "db1.collection1",
-    "db2.collection2",
-    "db3.collection3"
+    "database1.collection1",
+    "database1.collection2",
+    "database2.collection1"
   ]
 }
 ```
 
-Namespaces must be in `database.collection` format. Add as many as needed.
+Namespaces must be in `database.collection` format. Add as many as needed across any number of databases.
 
-### 2. Dry run (always run this first)
+### 2. Dry run first
+
+Always do a dry run before applying changes. Output is printed to the terminal and written to a timestamped log file simultaneously.
 
 **Linux:**
 ```bash
 chmod +x copy-missing-docs-linux-amd64
 ./copy-missing-docs-linux-amd64 --config config.json 2>&1 | tee copy-missing-docs-dryrun-$(date +%Y%m%d-%H%M%S).log
+```
+
+**Windows (PowerShell):**
+```powershell
+.\copy-missing-docs-windows-amd64.exe --config config.json 2>&1 | Tee-Object -FilePath copy-missing-docs-dryrun.log
 ```
 
 **Windows (CMD):**
@@ -55,12 +64,7 @@ copy-missing-docs-windows-amd64.exe --config config.json > copy-missing-docs-dry
 type copy-missing-docs-dryrun.log
 ```
 
-**Windows (PowerShell):**
-```powershell
-.\copy-missing-docs-windows-amd64.exe --config config.json 2>&1 | Tee-Object -FilePath copy-missing-docs-dryrun.log
-```
-
-Review the log output. Confirm INSERT and DELETE counts are as expected before proceeding.
+Review the output. Confirm INSERT and DELETE counts match expectations before applying.
 
 ### 3. Apply changes
 
@@ -69,15 +73,15 @@ Review the log output. Confirm INSERT and DELETE counts are as expected before p
 ./copy-missing-docs-linux-amd64 --config config.json --dry-run=false 2>&1 | tee copy-missing-docs-live-$(date +%Y%m%d-%H%M%S).log
 ```
 
+**Windows (PowerShell):**
+```powershell
+.\copy-missing-docs-windows-amd64.exe --config config.json --dry-run=false 2>&1 | Tee-Object -FilePath copy-missing-docs-live.log
+```
+
 **Windows (CMD):**
 ```cmd
 copy-missing-docs-windows-amd64.exe --config config.json --dry-run=false > copy-missing-docs-live.log 2>&1
 type copy-missing-docs-live.log
-```
-
-**Windows (PowerShell):**
-```powershell
-.\copy-missing-docs-windows-amd64.exe --config config.json --dry-run=false 2>&1 | Tee-Object -FilePath copy-missing-docs-live.log
 ```
 
 ---
@@ -87,7 +91,7 @@ type copy-missing-docs-live.log
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | `config.json` | Path to the JSON config file |
-| `--dry-run` | `true` | Print what would be done without writing. Set to `false` to apply. |
+| `--dry-run` | `true` | Preview changes without writing anything. Set to `false` to apply. |
 
 ---
 
@@ -95,23 +99,25 @@ type copy-missing-docs-live.log
 
 | Field | Required | Description |
 |---|---|---|
-| `source_uri` | Yes | MongoDB connection string for the source (DocumentDB) |
-| `destination_uri` | Yes | MongoDB connection string for the destination (Atlas) |
-| `namespaces` | Yes | Array of `"database.collection"` strings to sync |
+| `source_uri` | Yes | Connection string for the source (DocumentDB) |
+| `destination_uri` | Yes | Connection string for the destination (MongoDB Atlas) |
+| `namespaces` | Yes | List of `"database.collection"` namespaces to sync |
 
-### DocumentDB TLS (Linux)
-```json
-"source_uri": "mongodb://user:pass@docdb-endpoint:27017/?tls=true&tlsCAFile=/path/to/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred"
+### Connection string examples
+
+**DocumentDB with TLS — Linux:**
+```
+mongodb://user:pass@docdb-cluster.us-east-1.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=/path/to/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred
 ```
 
-### DocumentDB TLS (Windows — use forward slashes or escaped backslashes)
-```json
-"source_uri": "mongodb://user:pass@docdb-endpoint:27017/?tls=true&tlsCAFile=C:/path/to/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred"
+**DocumentDB with TLS — Windows (use forward slashes in path):**
+```
+mongodb://user:pass@docdb-cluster.us-east-1.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=C:/certs/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred
 ```
 
-### MongoDB Atlas
-```json
-"destination_uri": "mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority"
+**MongoDB Atlas:**
+```
+mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
 ```
 
 ---
@@ -121,10 +127,10 @@ type copy-missing-docs-live.log
 ```
 ============================================================
   copy-missing-docs  |  DRY RUN — no changes will be written
-  Config: config.json  |  Namespaces: 5
+  Config: config.json  |  Namespaces: 3
 ============================================================
 
-[DRY RUN] ── svoc-db.sync_job_log ──
+[DRY RUN] ── database1.collection1 ──
   Fetching _ids from source... 8155 docs
   Fetching _ids from destination... 8031 docs
   To INSERT:        124 docs
@@ -135,7 +141,7 @@ type copy-missing-docs-live.log
   [DRY RUN] ... and 121 more
   Would INSERT 124 | DELETE 0 | Errors 0
 
-[DRY RUN] ── ebook-delegate-db.token ──
+[DRY RUN] ── database2.collection1 ──
   Fetching _ids from source... 0 docs
   Fetching _ids from destination... 1 docs
   To INSERT:          0 docs
@@ -146,7 +152,7 @@ type copy-missing-docs-live.log
   Would INSERT 0 | DELETE 1 | Errors 0
 
 ============================================================
-  TOTAL  INSERT: 134  |  DELETE: 1  |  Errors: 0
+  TOTAL  INSERT: 124  |  DELETE: 1  |  Errors: 0
 ============================================================
 
   Re-run with --dry-run=false to apply changes.
@@ -159,16 +165,16 @@ type copy-missing-docs-live.log
 Requires Go 1.21+.
 
 ```bash
-# Install dependencies
+# Download dependencies
 go mod tidy
 
 # Build for current platform
 go build -o copy-missing-docs .
 
-# Cross-compile for Linux (from macOS or Windows)
+# Cross-compile for Linux (run from macOS or Windows)
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o copy-missing-docs-linux-amd64 .
 
-# Cross-compile for Windows (from macOS or Linux)
+# Cross-compile for Windows (run from macOS or Linux)
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o copy-missing-docs-windows-amd64.exe .
 ```
 
@@ -176,6 +182,6 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o copy-missin
 
 ## Notes
 
-- Documents are matched by `_id` only. Documents that exist on both sides but have different field values (missed updates) are not detected. Run `dsync --verify` after this tool to catch those.
-- The tool processes namespaces sequentially in the order listed in the config file.
-- Keep `config.json` out of version control — it contains database credentials.
+- Matching is by `_id` only. Documents that exist on both sides but differ in field values (missed updates) are not detected or fixed. Run `dsync --verify` after this tool to catch those.
+- Namespaces are processed sequentially in the order listed in the config file.
+- Keep `config.json` out of version control — it contains database credentials. Add it to `.gitignore`.
