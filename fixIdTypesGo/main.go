@@ -41,15 +41,15 @@ type collectionCfg struct {
 }
 
 type fixCfg struct {
-	Collections         []collectionCfg `json:"collections"`
-	BatchSize           int             `json:"batch_size"`
-	Workers             int             `json:"workers"`
+	Collections []collectionCfg `json:"collections"`
+	BatchSize   int             `json:"batch_size"`
+	Workers     int             `json:"workers"`
 	// ThrottleMs sleeps this many milliseconds in every worker after each batch.
 	// Increase to reduce load on the DocumentDB cluster at the cost of throughput.
 	// 0 = no throttle (default).
-	ThrottleMs          int             `json:"throttle_ms"`
-	DropBackupOnSuccess bool            `json:"drop_backup_on_success"`
-	OutputJSON          string          `json:"output_json"`
+	ThrottleMs          int    `json:"throttle_ms"`
+	DropBackupOnSuccess bool   `json:"drop_backup_on_success"`
+	OutputJSON          string `json:"output_json"`
 }
 
 type config struct {
@@ -329,9 +329,9 @@ func writeJSON(path string, data interface{}) error {
 
 type detectEntry struct {
 	Namespace   string `json:"namespace"`
-	Status      string `json:"status"`                // mixed | clean | empty | error
-	MinType     string `json:"min_type,omitempty"`    // ASC probe type (only when mixed)
-	MaxType     string `json:"max_type,omitempty"`    // DESC probe type (only when mixed)
+	Status      string `json:"status"`                 // mixed | clean | empty | error
+	MinType     string `json:"min_type,omitempty"`     // ASC probe type (only when mixed)
+	MaxType     string `json:"max_type,omitempty"`     // DESC probe type (only when mixed)
 	UniformType string `json:"uniform_type,omitempty"` // type when clean
 	Error       string `json:"error,omitempty"`
 }
@@ -645,10 +645,10 @@ type p1Stats struct {
 func phase1Move(ctx context.Context, client *mongo.Client, entry collectionCfg, batchSize, workers, throttleMs int, dryRun bool) p1Stats {
 	dot := strings.Index(entry.Namespace, ".")
 	dbName, collName := entry.Namespace[:dot], entry.Namespace[dot+1:]
-	db         := client.Database(dbName)
+	db := client.Database(dbName)
 	sourceColl := db.Collection(collName)
 	backupColl := db.Collection(collName + "_id_fix_backup")
-	backupNs   := dbName + "." + collName + "_id_fix_backup"
+	backupNs := dbName + "." + collName + "_id_fix_backup"
 
 	logStep("Phase 1 — move _id type %q docs → %s", entry.WrongType, backupNs)
 	if throttleMs > 0 {
@@ -657,7 +657,7 @@ func phase1Move(ctx context.Context, client *mongo.Client, entry collectionCfg, 
 
 	cursor, err := sourceColl.Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: entry.WrongType}}}},
-		options.Find().SetBatchSize(int32(batchSize)).SetNoCursorTimeout(true),
+		options.Find().SetBatchSize(int32(batchSize)),
 	)
 	if err != nil {
 		logError("Cannot open source cursor: %v", err)
@@ -808,7 +808,7 @@ type p2Stats struct {
 func phase2Transform(ctx context.Context, client *mongo.Client, entry collectionCfg, batchSize, workers, throttleMs int, dryRun bool) p2Stats {
 	dot := strings.Index(entry.Namespace, ".")
 	dbName, collName := entry.Namespace[:dot], entry.Namespace[dot+1:]
-	db         := client.Database(dbName)
+	db := client.Database(dbName)
 	sourceColl := db.Collection(collName)
 	backupColl := db.Collection(collName + "_id_fix_backup")
 
@@ -825,7 +825,7 @@ func phase2Transform(ctx context.Context, client *mongo.Client, entry collection
 	}
 
 	cursor, err := readColl.Find(ctx, filter,
-		options.Find().SetBatchSize(int32(batchSize)).SetNoCursorTimeout(true),
+		options.Find().SetBatchSize(int32(batchSize)),
 	)
 	if err != nil {
 		logError("Cannot open cursor: %v", err)
@@ -951,12 +951,12 @@ func phase2Transform(ctx context.Context, client *mongo.Client, entry collection
 	ticker.Stop()
 	close(tickDone)
 
-	ins   := atomic.LoadInt64(&inserted)
+	ins := atomic.LoadInt64(&inserted)
 	rdups := atomic.LoadInt64(&resumeDupes)
-	skp   := atomic.LoadInt64(&skipped)
-	errs  := atomic.LoadInt64(&errors)
-	wc    := atomic.LoadInt64(&warnCount)
-	sc    := atomic.LoadInt64(&skipCount)
+	skp := atomic.LoadInt64(&skipped)
+	errs := atomic.LoadInt64(&errors)
+	wc := atomic.LoadInt64(&warnCount)
+	sc := atomic.LoadInt64(&skipCount)
 	elapsed := time.Since(start).Seconds()
 
 	if wc > maxInlineWarn {
@@ -1002,7 +1002,7 @@ func phase3Cleanup(ctx context.Context, client *mongo.Client, entry collectionCf
 		logWarn("  Phase 2 had %s error(s) — retaining backup at %s", fmtInt(p2Errors), backupNs)
 		return
 	}
-	if err := client.Database(dbName).Collection(collName+"_id_fix_backup").Drop(ctx); err != nil {
+	if err := client.Database(dbName).Collection(collName + "_id_fix_backup").Drop(ctx); err != nil {
 		logWarn("  Could not drop backup: %v", err)
 	} else {
 		logOk("  Backup dropped")
@@ -1098,9 +1098,9 @@ func runFix(ctx context.Context, client *mongo.Client, cfg *fixCfg, dryRun bool)
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	modeFlag   := flag.String("mode", "", "Operation: detect | count | fix")
+	modeFlag := flag.String("mode", "", "Operation: detect | count | fix")
 	configFile := flag.String("config", "config.json", "Path to JSON config file")
-	dryRun     := flag.Bool("dry-run", true, "Dry run for fix mode (default: true)")
+	dryRun := flag.Bool("dry-run", true, "Dry run for fix mode (default: true)")
 	flag.Parse()
 
 	if *modeFlag == "" {
