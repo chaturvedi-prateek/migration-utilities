@@ -70,11 +70,42 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o check-changestreams-windows-
 
 ## Usage
 
-Set the connection string via `-uri` or the `DOCDB_URI` environment variable:
+The connection string can be supplied in three ways (the tool does not read a
+separate config file; use whichever option below fits your setup):
+
+**1. Inline via the `-uri` flag** (highest precedence, no export needed):
+
+```bash
+./check-changestreams -ca-file global-bundle.pem \
+  -uri "mongodb://user:pass@your-cluster:27017/?tls=true&replicaSet=rs0&readPreference=secondaryPreferred"
+```
+
+**2. Inline environment variable, scoped to a single command:**
+
+```bash
+DOCDB_URI="mongodb://user:pass@your-cluster:27017/?tls=true&replicaSet=rs0&readPreference=secondaryPreferred" \
+  ./check-changestreams -ca-file global-bundle.pem
+```
+
+**3. Config file sourced into the environment** (keep secrets out of your shell history):
+
+```bash
+# docdb.env
+export DOCDB_URI="mongodb://user:pass@your-cluster:27017/?tls=true&replicaSet=rs0&readPreference=secondaryPreferred"
+```
+
+```bash
+source docdb.env
+./check-changestreams -ca-file global-bundle.pem
+```
+
+**4. Exported environment variable** (persists for the whole session):
 
 ```bash
 export DOCDB_URI="mongodb://user:pass@your-cluster:27017/?tls=true&replicaSet=rs0&readPreference=secondaryPreferred"
 ```
+
+> If both `-uri` and `DOCDB_URI` are set, the `-uri` flag wins.
 
 Then run:
 
