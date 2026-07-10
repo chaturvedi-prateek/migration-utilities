@@ -29,11 +29,43 @@ Download the CA bundle:
 curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 ```
 
-## Install / Build
+## Prebuilt binaries (run without building)
+
+Prebuilt binaries are included so you can run the tool directly without a Go
+toolchain. Pick the one for your platform:
+
+| Platform | Binary |
+| --- | --- |
+| Linux (x86_64) | `check-changestreams-linux-amd64` |
+| Linux (ARM64) | `check-changestreams-linux-arm64` |
+| Windows (x86_64) | `check-changestreams-windows-amd64.exe` |
+
+**Linux:**
+
+```bash
+chmod +x check-changestreams-linux-amd64
+./check-changestreams-linux-amd64 -ca-file global-bundle.pem
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\check-changestreams-windows-amd64.exe -ca-file global-bundle.pem
+```
+
+## Build from source
 
 ```bash
 go mod tidy
 go build -o check-changestreams .
+```
+
+To reproduce the cross-platform binaries yourself:
+
+```bash
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o check-changestreams-linux-amd64 .
+GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -o check-changestreams-linux-arm64 .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o check-changestreams-windows-amd64.exe .
 ```
 
 ## Usage
