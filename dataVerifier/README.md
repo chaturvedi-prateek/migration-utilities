@@ -72,11 +72,11 @@ python statisticalDataVerifier.py samquote tasks 0
 python statisticalDataVerifier.py mydb mycollection 5000
 ```
 
-### Examples using run_verifier_custom.sh
+### Examples using runVerifierCustom.sh
 
 ```bash
 # Compare 5000 documents from mydb.mycollection in a loop of 200 iterations
-./run_verifier_custom.sh 200 samquote quotes 5000
+./runVerifierCustom.sh 200 samquote quotes 5000
 ```
 
 ## Performance Considerations

@@ -1,0 +1,43 @@
+{
+  "source_uri": "mongodb://username:password@docdb-cluster.ap-south-1.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=/path/to/ap-south-1-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred",
+
+  "log_file": "fixIdTypes.log",
+
+  "detect": {
+    "databases": [
+      "common-warranty-db",
+      "svoi-db"
+    ],
+    "output_json": "detect_results.json"
+  },
+
+  "count": {
+    "namespaces": [
+      "common-warranty-db.vm_warranty_approval_online",
+      "svoi-db.consumer_did_mapping_log"
+    ],
+    "output_json": "count_results.json"
+  },
+
+  "fix": {
+    "collections": [
+      {
+        "namespace": "common-warranty-db.vm_warranty_approval_online",
+        "wrong_type": "string",
+        "fix_strategy": "string_to_objectid",
+        "new_id_on_failure": false
+      },
+      {
+        "namespace": "svoi-db.consumer_did_mapping_log",
+        "wrong_type": "object",
+        "fix_strategy": "nested_objectid",
+        "new_id_on_failure": true
+      }
+    ],
+    "batch_size": 1000,
+    "workers": 4,
+    "throttle_ms": 0,
+    "drop_backup_on_success": false,
+    "output_json": "fix_results.json"
+  }
+}
