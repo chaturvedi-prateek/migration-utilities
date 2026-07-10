@@ -1,9 +1,0 @@
-{
-  "source_uri": "mongodb://username:password@docdb-endpoint:27017/?tls=true&tlsCAFile=/path/to/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred",
-  "destination_uri": "mongodb+srv://username:password@cluster.mongodb.net/?retryWrites=true&w=majority",
-  "namespaces": [
-    "database1.collection1",
-    "database1.collection2",
-    "database2.collection1"
-  ]
-}
