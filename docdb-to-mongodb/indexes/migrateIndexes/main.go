@@ -88,9 +88,9 @@ type opResult struct {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	configFile  := flag.String("config", "config.json", "Path to JSON config file")
-	dryRun      := flag.Bool("dry-run", true, "Print what would be done without applying changes (default: true)")
-	mode        := flag.String("mode", "create", "'create' = pre-cutover  |  'rectify' = post-cutover TTL+unique fix")
+	configFile := flag.String("config", "config.json", "Path to JSON config file")
+	dryRun := flag.Bool("dry-run", true, "Print what would be done without applying changes (default: true)")
+	mode := flag.String("mode", "create", "'create' = pre-cutover  |  'rectify' = post-cutover TTL+unique fix")
 	concurrency := flag.Int("concurrency", 8, "Max simultaneous index operations on the destination")
 	flag.Parse()
 
@@ -161,13 +161,17 @@ func collectIndexSpecs(ctx context.Context, src *mongo.Client, databases []strin
 	var specs []indexSpec
 	for _, dbName := range databases {
 		database := src.Database(dbName)
-		collNames, err := database.ListCollectionNames(ctx, bson.D{{Key: "type", Value: "collection"}})
+		// Note: do not filter listCollections by {type:"collection"} — Amazon
+		// DocumentDB rejects that filter ("Field 'type' is not currently
+		// supported"). List all collections and skip views/system client-side.
+		collSpecs, err := database.ListCollectionSpecifications(ctx, bson.D{})
 		if err != nil {
 			return nil, fmt.Errorf("listCollections on %s: %w", dbName, err)
 		}
 
-		for _, collName := range collNames {
-			if strings.HasPrefix(collName, "system.") {
+		for _, collSpec := range collSpecs {
+			collName := collSpec.Name
+			if collSpec.Type == "view" || strings.HasPrefix(collName, "system.") {
 				continue
 			}
 			cursor, err := database.Collection(collName).Indexes().List(ctx)
@@ -407,7 +411,7 @@ func rectifyPhase2(ctx context.Context, dst *mongo.Client, spec indexSpec, dryRu
 
 func runPool(specs []indexSpec, concurrency int, fn func(indexSpec) error) []opResult {
 	jobs := make(chan indexSpec, len(specs))
-	out  := make(chan opResult, len(specs))
+	out := make(chan opResult, len(specs))
 
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
