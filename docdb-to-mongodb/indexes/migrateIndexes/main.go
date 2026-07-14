@@ -143,10 +143,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 	defer cancel()
 
-	srcClient := mustConnect(ctx, cfg.SourceURI, "source")
+	srcClient := mustConnect(ctx, cfg.SourceURI, "source", *concurrency)
 	defer srcClient.Disconnect(ctx)
 
-	dstClient := mustConnect(ctx, cfg.DestinationURI, "destination")
+	dstClient := mustConnect(ctx, cfg.DestinationURI, "destination", *concurrency)
 	defer dstClient.Disconnect(ctx)
 
 	modeLabel := "LIVE RUN — changes will be applied"
@@ -172,12 +172,68 @@ func main() {
 	}
 }
 
-func mustConnect(ctx context.Context, uri, label string) *mongo.Client {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+func mustConnect(ctx context.Context, uri, label string, maxPool int) *mongo.Client {
+	if maxPool < 4 {
+		maxPool = 4
+	}
+	opts := options.Client().
+		ApplyURI(uri).
+		SetServerSelectionTimeout(5 * time.Minute). // wait out a busy primary during index builds
+		SetConnectTimeout(60 * time.Second).
+		SetMaxPoolSize(uint64(maxPool) + 5). // headroom above worker concurrency + monitor
+		SetMaxConnecting(uint64(maxPool)).   // establish all workers' connections at once (default is 2)
+		SetRetryWrites(false)                // DocumentDB source doesn't support retryable writes
+
+	client, err := mongo.Connect(ctx, opts)
 	if err != nil {
 		fatalf("ERROR: cannot connect to %s: %v\n", label, err)
 	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.Ping(pingCtx, nil); err != nil {
+		fatalf("ERROR: cannot reach %s: %v\n", label, err)
+	}
 	return client
+}
+
+// isTransient reports whether an error is worth retrying — pool checkout, server
+// selection, or network timeouts that can occur while a busy primary builds
+// indexes.
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if mongo.IsTimeout(err) || mongo.IsNetworkError(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection pool") ||
+		strings.Contains(msg, "server selection") ||
+		strings.Contains(msg, "context deadline exceeded")
+}
+
+// runCmdRetry runs a destination command, retrying transient failures with
+// linear backoff. createIndexes / collMod are idempotent, so retrying is safe.
+func runCmdRetry(ctx context.Context, db *mongo.Database, cmd bson.D) error {
+	const maxAttempts = 5
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = db.RunCommand(ctx, cmd).Err(); err == nil || !isTransient(err) {
+			return err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		backoff := time.Duration(attempt) * 3 * time.Second
+		outf("  [RETRY %d/%d] transient error, retrying in %s: %v\n", attempt, maxAttempts, backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 // ── Collect indexes from source ───────────────────────────────────────────────
@@ -320,7 +376,7 @@ func createIndex(ctx context.Context, dst *mongo.Client, spec indexSpec, dryRun 
 		{Key: "createIndexes", Value: spec.Collection},
 		{Key: "indexes", Value: bson.A{idxDoc}},
 	}
-	if err := dst.Database(spec.DB).RunCommand(ctx, cmd).Err(); err != nil {
+	if err := runCmdRetry(ctx, dst.Database(spec.DB), cmd); err != nil {
 		return fmt.Errorf("createIndex %s.%s.%s: %w", spec.DB, spec.Collection, spec.Name, err)
 	}
 	outf("  OK  createIndex  %s.%s.%s%s\n", spec.DB, spec.Collection, spec.Name, notes)
@@ -392,7 +448,7 @@ func rectifyPhase1(ctx context.Context, dst *mongo.Client, spec indexSpec, dryRu
 					{Key: "prepareUnique", Value: true},
 				}},
 			}
-			if err := dst.Database(spec.DB).RunCommand(ctx, cmd).Err(); err != nil {
+			if err := runCmdRetry(ctx, dst.Database(spec.DB), cmd); err != nil {
 				errs = append(errs, fmt.Sprintf("prepareUnique: %v", err))
 			} else {
 				outf("  OK  prepareUnique  %s.%s.%s\n", spec.DB, spec.Collection, spec.Name)
@@ -412,7 +468,7 @@ func rectifyPhase1(ctx context.Context, dst *mongo.Client, spec indexSpec, dryRu
 					{Key: "expireAfterSeconds", Value: spec.OriginalTTL},
 				}},
 			}
-			if err := dst.Database(spec.DB).RunCommand(ctx, cmd).Err(); err != nil {
+			if err := runCmdRetry(ctx, dst.Database(spec.DB), cmd); err != nil {
 				errs = append(errs, fmt.Sprintf("restoreTTL: %v", err))
 			} else {
 				outf("  OK  restoreTTL    %s.%s.%s  → %ds\n",
@@ -439,7 +495,7 @@ func rectifyPhase2(ctx context.Context, dst *mongo.Client, spec indexSpec, dryRu
 			{Key: "unique", Value: true},
 		}},
 	}
-	if err := dst.Database(spec.DB).RunCommand(ctx, cmd).Err(); err != nil {
+	if err := runCmdRetry(ctx, dst.Database(spec.DB), cmd); err != nil {
 		return fmt.Errorf("%s.%s.%s unique:true: %w", spec.DB, spec.Collection, spec.Name, err)
 	}
 	outf("  OK  unique:true   %s.%s.%s\n", spec.DB, spec.Collection, spec.Name)
