@@ -107,7 +107,35 @@ Edit `config.json`:
 | `--config` | `config.json` | Path to the JSON config file. |
 | `--mode` | `create` | `create` \| `verify` \| `rectify`. |
 | `--dry-run` | `true` | Preview without writing. Set `false` to apply. Ignored by `verify` (always read-only). |
-| `--concurrency` | `8` | Max simultaneous index operations on the destination. |
+| `--concurrency` | `8` | Number of index operations run in parallel on the destination (also sizes the connection pool). See [Tuning parallelism](#tuning-parallelism). |
+
+---
+
+## Tuning parallelism
+
+`--concurrency` controls how many `createIndex` / `collMod` operations run at
+once. The tool sizes the destination connection pool from this value, so all
+workers can open connections simultaneously (it raises the driver's
+`maxConnecting`, which otherwise defaults to **2** — the reason a run can appear
+"stuck at 2 indexes at a time").
+
+```bash
+# More parallelism (large destination, e.g. Atlas M40+)
+./bin/migrateIndexes-linux-amd64 --config config.json --mode=create --dry-run=false --concurrency=16
+
+# Less parallelism (small tier like M10/M20, or if you hit connection/timeout errors)
+./bin/migrateIndexes-linux-amd64 --config config.json --mode=create --dry-run=false --concurrency=2
+```
+
+Notes:
+- MongoDB serializes multiple index builds **on the same collection** server-side,
+  so indexes on one collection won't parallelize regardless of `--concurrency`;
+  the setting speeds up builds spread **across many collections**.
+- Higher concurrency increases load on the destination primary. If you see
+  connection-pool / server-selection timeouts, lower `--concurrency`.
+- The connection pool is sized to `--concurrency + 5` (headroom for the progress
+  monitor); server-selection timeout is 5 minutes and transient errors are
+  retried automatically.
 
 ---
 
