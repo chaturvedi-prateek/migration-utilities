@@ -1,0 +1,48 @@
+{
+  "//PURPOSE": "COLLISION-DETECTION backfill sink. Uses INSERT-only writes so a",
+  "//PURPOSE2": "cross-source _id that already exists FAILS with E11000 and lands in the",
+  "//PURPOSE3": "DLQ instead of silently overwriting — this is how overlaps surface for a",
+  "//PURPOSE4": "decision. Run this ONLY during the initial snapshot phase, then delete it",
+  "//PURPOSE5": "and start mongo-sink-cdc.json for steady-state CDC (see README, Phasing).",
+  "//REQUIRES": "Pair with source setting publish.full.document.only=true during this",
+  "//REQUIRES2": "phase, and drive one sink per target namespace (database/collection set",
+  "//REQUIRES3": "explicitly below, or one instance per topic), because insert-only mode",
+  "//REQUIRES4": "writes the plain document and cannot read ns.db/ns.coll for routing.",
+  "name": "mongo-sink-backfill",
+  "config": {
+    "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
+    "tasks.max": "8",
+
+    "connection.uri": "mongodb+srv://user:pass@atlas-gcp.mongodb.net/?retryWrites=true&w=majority",
+
+    "//topic": "One merged topic == one target collection. Set database/collection to it.",
+    "topics": "cdc.juno.orders",
+    "database": "juno",
+    "collection": "orders",
+
+    "//insert": "Insert-only: duplicate _id -> E11000 -> DLQ (NOT an overwrite).",
+    "writemodel.strategy": "com.mongodb.kafka.connect.sink.writemodel.strategy.InsertOneDefaultStrategy",
+    "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.PartialValueStrategy",
+    "document.id.strategy.partial.value.projection.type": "AllowList",
+    "document.id.strategy.partial.value.projection.list": "_id",
+
+    "max.batch.size": "2000",
+    "bulk.write.ordered": "false",
+    "max.num.retries": "3",
+
+    "//errs": "Duplicate-key failures are EXPECTED signal here — capture, don't crash.",
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "dlq.collision.juno.orders",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.deadletterqueue.topic.replication.factor": "3",
+
+    "consumer.override.auto.offset.reset": "earliest",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}

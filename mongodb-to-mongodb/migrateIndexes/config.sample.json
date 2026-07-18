@@ -1,0 +1,15 @@
+{
+  "sources": [
+    {
+      "label": "cluster01",
+      "uri": "mongodb://user:pass@rs01-host:27017/?replicaSet=rs0&readPreference=secondary&readPreferenceTags=nodeType:hidden"
+    },
+    {
+      "label": "cluster02",
+      "uri": "mongodb://user:pass@rs02-host:27017/?replicaSet=rs0&readPreference=secondary&readPreferenceTags=nodeType:hidden"
+    }
+  ],
+  "destination_uri": "mongodb+srv://user:pass@atlas-gcp.mongodb.net/?retryWrites=true&w=majority",
+  "databases": [],
+  "log_file": ""
+}

@@ -1,0 +1,48 @@
+{
+  "name": "mongo-source-__LABEL__",
+  "config": {
+    "connector.class": "com.mongodb.kafka.connect.MongoSourceConnector",
+    "tasks.max": "1",
+
+    "connection.uri": "__SOURCE_URI__",
+
+    "//": "Snapshot existing data, then tail the change stream — full copy + CDC in one lifecycle.",
+    "copy.existing": "true",
+    "copy.existing.namespace.regex": "__NS_REGEX__",
+    "copy.existing.queue.size": "32000",
+    "copy.existing.max.threads": "4",
+
+    "//pipeline": "Restrict the change stream to the databases being migrated.",
+    "pipeline": "__PIPELINE__",
+
+    "change.stream.full.document": "updateLookup",
+    "publish.full.document.only": "false",
+
+    "//topics": "SAME topic.prefix across ALL 10 sources so same db.coll from every",
+    "//topics2": "cluster lands on ONE topic (cdc.<db>.<coll>) => collections MERGE.",
+    "topic.prefix": "cdc",
+
+    "//key": "Emit the document _id as the message key => per-_id ordering & partitioning.",
+    "output.format.key": "json",
+    "output.format.value": "json",
+    "document.id.strategy.overwrite.existing": "false",
+
+    "//resume": "Unique offset partition per source + heartbeats keep the resume token",
+    "//resume2": "advancing on quiet collections so restarts never fall off the oplog.",
+    "offset.partition.name": "src-__LABEL__",
+    "heartbeat.interval.ms": "10000",
+
+    "poll.max.batch.size": "10000",
+    "poll.await.time.ms": "1000",
+    "batch.size": "2000",
+
+    "mongo.errors.tolerance": "all",
+    "mongo.errors.log.enable": "true",
+    "mongo.errors.deadletterqueue.topic.name": "dlq.source.__LABEL__",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
