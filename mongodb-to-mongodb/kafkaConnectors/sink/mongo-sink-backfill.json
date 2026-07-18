@@ -16,9 +16,9 @@
     "connection.uri": "mongodb+srv://user:pass@atlas-gcp.mongodb.net/?retryWrites=true&w=majority",
 
     "//topic": "One merged topic == one target collection. Set database/collection to it.",
-    "topics": "cdc.juno.orders",
-    "database": "juno",
-    "collection": "orders",
+    "topics": "cdc.<db>.<coll>",
+    "database": "<db>",
+    "collection": "<coll>",
 
     "//insert": "Insert-only: duplicate _id -> E11000 -> DLQ (NOT an overwrite).",
     "writemodel.strategy": "com.mongodb.kafka.connect.sink.writemodel.strategy.InsertOneDefaultStrategy",
@@ -34,7 +34,7 @@
     "errors.tolerance": "all",
     "errors.log.enable": "true",
     "errors.log.include.messages": "true",
-    "errors.deadletterqueue.topic.name": "dlq.collision.juno.orders",
+    "errors.deadletterqueue.topic.name": "dlq.collision.<db>.<coll>",
     "errors.deadletterqueue.context.headers.enable": "true",
     "errors.deadletterqueue.topic.replication.factor": "3",
 

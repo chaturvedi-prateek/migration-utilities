@@ -3,15 +3,15 @@
   "//uri": "Point reads at HIDDEN nodes so the snapshot never touches production primaries.",
   "//dbs": "'databases' drives both copy.existing.namespace.regex and the change-stream pipeline.",
   "sources": [
-    { "label": "cluster01", "uri": "mongodb://user:pass@rs01-a:27017,rs01-b:27017/?replicaSet=rs01&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["juno", "orders"] },
-    { "label": "cluster02", "uri": "mongodb://user:pass@rs02-a:27017,rs02-b:27017/?replicaSet=rs02&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["juno", "catalog"] },
-    { "label": "cluster03", "uri": "mongodb://user:pass@rs03-a:27017/?replicaSet=rs03&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["payments"] },
-    { "label": "cluster04", "uri": "mongodb://user:pass@rs04-a:27017/?replicaSet=rs04&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["inventory"] },
-    { "label": "cluster05", "uri": "mongodb://user:pass@rs05-a:27017/?replicaSet=rs05&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["users"] },
-    { "label": "cluster06", "uri": "mongodb://user:pass@rs06-a:27017/?replicaSet=rs06&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["cart"] },
-    { "label": "cluster07", "uri": "mongodb://user:pass@rs07-a:27017/?replicaSet=rs07&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["shipping"] },
-    { "label": "cluster08", "uri": "mongodb://user:pass@rs08-a:27017/?replicaSet=rs08&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["reviews"] },
-    { "label": "cluster09", "uri": "mongodb://user:pass@rs09-a:27017/?replicaSet=rs09&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["analytics"] },
-    { "label": "cluster10", "uri": "mongodb://user:pass@rs10-a:27017/?replicaSet=rs10&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["notifications"] }
+    { "label": "cluster01", "uri": "mongodb://user:pass@rs01-a:27017,rs01-b:27017/?replicaSet=rs01&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_a", "db_b"] },
+    { "label": "cluster02", "uri": "mongodb://user:pass@rs02-a:27017,rs02-b:27017/?replicaSet=rs02&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_a", "db_c"] },
+    { "label": "cluster03", "uri": "mongodb://user:pass@rs03-a:27017/?replicaSet=rs03&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_d"] },
+    { "label": "cluster04", "uri": "mongodb://user:pass@rs04-a:27017/?replicaSet=rs04&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_e"] },
+    { "label": "cluster05", "uri": "mongodb://user:pass@rs05-a:27017/?replicaSet=rs05&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_f"] },
+    { "label": "cluster06", "uri": "mongodb://user:pass@rs06-a:27017/?replicaSet=rs06&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_g"] },
+    { "label": "cluster07", "uri": "mongodb://user:pass@rs07-a:27017/?replicaSet=rs07&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_h"] },
+    { "label": "cluster08", "uri": "mongodb://user:pass@rs08-a:27017/?replicaSet=rs08&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_i"] },
+    { "label": "cluster09", "uri": "mongodb://user:pass@rs09-a:27017/?replicaSet=rs09&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_j"] },
+    { "label": "cluster10", "uri": "mongodb://user:pass@rs10-a:27017/?replicaSet=rs10&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_k"] }
   ]
 }

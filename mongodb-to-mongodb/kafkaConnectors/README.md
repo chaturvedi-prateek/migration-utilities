@@ -5,8 +5,8 @@ replica sets → one 5-node Atlas cluster (GCP)** using the MongoDB Kafka
 **source** and **sink** connectors, doing **full copy + CDC** in one lifecycle,
 **merging** same-name collections, at high throughput.
 
-The **reverse/rollback** pipeline (Atlas → self-managed on AWS) is the separate
-Lenskart playbook; this directory is the forward direction only.
+The **reverse/rollback** pipeline (Atlas → self-managed) is a separate
+playbook; this directory is the forward direction only.
 
 ```
 on-prem RS x10 ──(source connectors)──▶ topics cdc.<db>.<coll> ──(sink)──▶ Atlas GCP
@@ -89,7 +89,7 @@ Phase A and go straight to `mongo-sink-cdc.json`.
 # 0. Prereqs: distributed Connect workers running with connect-distributed.properties,
 #    MongoDB Kafka Connector in plugin.path, topics' internal RF>=3.
 
-# 1. Build the source configs
+# 1. Build the source configs   (requires python3)
 cp sources.sample.json sources.json      # edit URIs (hidden nodes!) + databases
 ./generate-sources.sh                     # -> source/generated/mongo-source-*.json
 
@@ -117,7 +117,7 @@ saturate Atlas writes or the on-prem→GCP link.
 - **Zero-downtime:** keep apps writing on-prem until each collection's CDC lag is
   ~0, then flip that service's connection string to Atlas. Migrate service by
   service.
-- **Rollback:** the reverse Atlas→AWS pipeline (Lenskart playbook) stays running
-  so on-prem remains current until the soak period ends.
+- **Rollback:** the reverse Atlas→self-managed pipeline stays running so the
+  source remains current until the soak period ends.
 - **Post-cutover indexes:** run `../migrateIndexes --mode=rectify` to restore
   real TTL values and enforce `unique:true`, then `--mode=verify` (expect PASS).
