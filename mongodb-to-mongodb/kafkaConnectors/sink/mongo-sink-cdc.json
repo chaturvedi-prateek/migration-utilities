@@ -1,0 +1,52 @@
+{
+  "name": "mongo-sink-cdc",
+  "config": {
+    "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
+
+    "//scale": "tasks.max should equal the partition count of the busiest topic.",
+    "tasks.max": "12",
+
+    "connection.uri": "mongodb+srv://user:pass@atlas-gcp.mongodb.net/?retryWrites=true&w=majority",
+
+    "//topics": "Consume every merged CDC topic produced by the 10 source connectors.",
+    "topics.regex": "cdc\\..*",
+
+    "//merge": "Route each event to target <ns.db>.<ns.coll>. Same-name collections",
+    "//merge2": "from different clusters share one topic and land in ONE target collection.",
+    "namespace.mapper": "com.mongodb.kafka.connect.sink.namespace.mapping.FieldPathNamespaceMapper",
+    "namespace.mapper.value.database.field": "ns.db",
+    "namespace.mapper.value.collection.field": "ns.coll",
+    "namespace.mapper.error.if.invalid": "true",
+    "database": "default_db_placeholder",
+    "collection": "default_coll_placeholder",
+
+    "//cdc": "Apply insert/update/replace/delete with correct _id semantics (idempotent).",
+    "change.data.capture.handler": "com.mongodb.kafka.connect.sink.cdc.mongodb.ChangeStreamHandler",
+    "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.FullKeyStrategy",
+    "document.id.strategy.overwrite.existing": "true",
+    "delete.on.null.values": "false",
+
+    "//perf": "Bulk, unordered writes for throughput; retries for transient Atlas hiccups.",
+    "max.batch.size": "5000",
+    "bulk.write.ordered": "false",
+    "max.num.retries": "5",
+    "retries.defer.timeout": "5000",
+    "rate.limiting.timeout": "0",
+
+    "//errs": "Tolerate & DLQ bad events instead of stalling the whole sink.",
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "dlq.sink.cdc",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.deadletterqueue.topic.replication.factor": "3",
+
+    "consumer.override.auto.offset.reset": "earliest",
+    "consumer.override.max.poll.records": "2000",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
