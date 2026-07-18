@@ -18,6 +18,16 @@
 //	  find the ACTUAL duplicate _ids shared across clusters. Memory stays O(k)
 //	  (one _id per cluster cursor), so it scales to large collections.
 //
+// Output & resumability:
+//
+//	Detailed findings are written to a RESULTS LOG FILE (--out); the console
+//	shows only progress + the final summary. Progress is checkpointed to a
+//	JSON file (--checkpoint) after every namespace, and — in exact mode —
+//	periodically WITHIN a namespace via an _id watermark. If the run is killed,
+//	re-running with the same --config/--checkpoint resumes: finished namespaces
+//	are skipped, and a half-scanned exact namespace continues from its watermark
+//	instead of restarting. Use --restart to ignore an existing checkpoint.
+//
 // Read-only. Exit codes:
 //
 //	0  no overlap found
@@ -31,7 +41,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strings"
@@ -46,30 +55,18 @@ import (
 
 var systemDBs = map[string]bool{"admin": true, "local": true, "config": true}
 
-// ── Output ──────────────────────────────────────────────────────────────────
-
-var (
-	logWriter io.Writer = os.Stdout
-	errWriter io.Writer = os.Stderr
+// checkpoint every this many merged _ids, and at least this often, in exact mode.
+const (
+	exactCheckpointEveryN = 100_000
+	checkpointMinInterval = 5 * time.Second
 )
 
-func initLogWriter(logFile string) (io.Closer, error) {
-	if logFile == "" {
-		return nil, nil
-	}
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open log file %q: %w", logFile, err)
-	}
-	logWriter = io.MultiWriter(os.Stdout, f)
-	errWriter = io.MultiWriter(os.Stderr, f)
-	return f, nil
-}
+// ── Console (progress) ──────────────────────────────────────────────────────
 
-func outf(format string, args ...interface{}) { fmt.Fprintf(logWriter, format, args...) }
-func outln(args ...interface{})               { fmt.Fprintln(logWriter, args...) }
+func outf(format string, args ...interface{}) { fmt.Fprintf(os.Stdout, format, args...) }
+func outln(args ...interface{})               { fmt.Fprintln(os.Stdout, args...) }
 func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(errWriter, format, args...)
+	fmt.Fprintf(os.Stderr, format, args...)
 	os.Exit(1)
 }
 
@@ -83,7 +80,7 @@ type sourceEntry struct {
 
 type config struct {
 	Sources []sourceEntry `json:"sources"`
-	LogFile string        `json:"log_file"`
+	LogFile string        `json:"log_file"` // default results file if --out not given
 }
 
 func loadConfig(path string) (*config, error) {
@@ -115,13 +112,117 @@ func loadConfig(path string) (*config, error) {
 	return &cfg, nil
 }
 
+// ── Result + checkpoint ─────────────────────────────────────────────────────
+
+type nsResult struct {
+	NS        string          `json:"ns"`
+	Clusters  []string        `json:"clusters"`
+	Overlap   bool            `json:"overlap"`
+	DupCount  int64           `json:"dup_count"`
+	Samples   []string        `json:"samples"`
+	Done      bool            `json:"done"`
+	Watermark json.RawMessage `json:"watermark,omitempty"` // exact-mode: extjson {"_id": <last processed>}
+	Report    string          `json:"report"`              // human-readable block for the results file
+}
+
+type checkpoint struct {
+	Mode      string               `json:"mode"`
+	StartedAt string               `json:"started_at"`
+	Results   map[string]*nsResult `json:"results"`
+}
+
+// checkpointer persists progress atomically and throttles disk writes.
+type checkpointer struct {
+	mu       sync.Mutex
+	path     string
+	cp       *checkpoint
+	lastSave time.Time
+}
+
+func (c *checkpointer) get(ns string) *nsResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.cp.Results[ns]; ok {
+		cp := *r // shallow copy is enough for the fields the caller reads
+		return &cp
+	}
+	return nil
+}
+
+// put stores a result snapshot and saves to disk if forced or the throttle
+// interval elapsed. Callers pass a fresh snapshot each time (no shared mutation).
+func (c *checkpointer) put(r *nsResult, force bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cp.Results[r.NS] = r
+	if force || time.Since(c.lastSave) >= checkpointMinInterval {
+		c.saveLocked()
+	}
+}
+
+func (c *checkpointer) saveLocked() {
+	tmp := c.path + ".tmp"
+	b, err := json.MarshalIndent(c.cp, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, c.path) // atomic replace
+	c.lastSave = time.Now()
+}
+
+func loadCheckpoint(path string) (*checkpoint, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var cp checkpoint
+	if err := json.Unmarshal(b, &cp); err != nil {
+		return nil, fmt.Errorf("checkpoint %q is corrupt: %w (use --restart to ignore)", path, err)
+	}
+	if cp.Results == nil {
+		cp.Results = map[string]*nsResult{}
+	}
+	return &cp, nil
+}
+
+// watermark helpers — serialize a single _id value as extended JSON so its BSON
+// type survives a restart.
+func marshalWatermark(id interface{}) json.RawMessage {
+	b, err := bson.MarshalExtJSON(bson.M{"_id": id}, true, false)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
+func unmarshalWatermark(raw json.RawMessage) (interface{}, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var m bson.M
+	if err := bson.UnmarshalExtJSON([]byte(raw), true, &m); err != nil {
+		return nil, false
+	}
+	v, ok := m["_id"]
+	return v, ok
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
 	configFile := flag.String("config", "config.json", "Path to JSON config file")
 	mode := flag.String("mode", "range", "'range' = fast min/max interval check | 'exact' = streaming k-way merge for real duplicate _ids")
-	sampleCap := flag.Int("sample", 20, "Max duplicate _ids to print per namespace (exact mode)")
+	sampleCap := flag.Int("sample", 20, "Max duplicate _ids to record per namespace (exact mode)")
 	concurrency := flag.Int("concurrency", 4, "Namespaces scanned in parallel")
+	out := flag.String("out", "", "Results log file (default: config.log_file, else overlap-report.<mode>.log)")
+	checkpointPath := flag.String("checkpoint", "", "Checkpoint file for resume (default: <out>.checkpoint.json)")
+	restart := flag.Bool("restart", false, "Ignore any existing checkpoint and start fresh")
 	flag.Parse()
 
 	if *mode != "range" && *mode != "exact" {
@@ -132,21 +233,56 @@ func main() {
 	if err != nil {
 		fatalf("ERROR: %v\n", err)
 	}
-	logCloser, err := initLogWriter(cfg.LogFile)
+
+	// Resolve output + checkpoint paths.
+	outPath := *out
+	if outPath == "" {
+		outPath = cfg.LogFile
+	}
+	if outPath == "" {
+		outPath = fmt.Sprintf("overlap-report.%s.log", *mode)
+	}
+	ckptPath := *checkpointPath
+	if ckptPath == "" {
+		ckptPath = outPath + ".checkpoint.json"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	defer cancel()
+
+	// Load or init checkpoint.
+	var cp *checkpoint
+	resuming := false
+	if !*restart {
+		cp, err = loadCheckpoint(ckptPath)
+		if err != nil {
+			fatalf("ERROR: %v\n", err)
+		}
+		if cp != nil && cp.Mode != *mode {
+			fatalf("ERROR: checkpoint %q is for mode %q, but --mode=%q. Use --restart or a different --checkpoint.\n",
+				ckptPath, cp.Mode, *mode)
+		}
+	}
+	if cp == nil {
+		cp = &checkpoint{Mode: *mode, StartedAt: time.Now().Format(time.RFC3339), Results: map[string]*nsResult{}}
+	} else {
+		resuming = true
+	}
+	ckpt := &checkpointer{path: ckptPath, cp: cp}
+
+	// Open results file: append when resuming (keep prior run's blocks), else truncate.
+	resFile, wroteHeader, err := openResults(outPath, resuming, *mode)
 	if err != nil {
 		fatalf("ERROR: %v\n", err)
 	}
-	if logCloser != nil {
-		defer logCloser.Close()
-	}
+	defer resFile.Close()
+	_ = wroteHeader
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Hour)
-	defer cancel()
+	outf("\n%s\n  id-overlap-scan  |  mode=%s  |  sources=%d\n  results: %s\n  checkpoint: %s%s\n%s\n",
+		ruler(70), *mode, len(cfg.Sources), outPath, ckptPath,
+		map[bool]string{true: "  (RESUMING)", false: ""}[resuming], ruler(70))
 
-	outf("\n%s\n  id-overlap-scan  |  mode=%s  |  sources=%d\n%s\n",
-		ruler(70), *mode, len(cfg.Sources), ruler(70))
-
-	// Connect all sources and discover namespaces.
+	// Connect + discover namespaces.
 	clients := map[string]*mongo.Client{}
 	for _, s := range cfg.Sources {
 		clients[s.Label] = mustConnect(ctx, s.URI, "source:"+s.Label)
@@ -157,7 +293,6 @@ func main() {
 		}
 	}()
 
-	// nsToClusters: "db.coll" -> sorted cluster labels holding it.
 	nsToClusters := map[string][]string{}
 	for _, s := range cfg.Sources {
 		nss, err := listNamespaces(ctx, clients[s.Label], s.Databases)
@@ -168,8 +303,6 @@ func main() {
 			nsToClusters[ns] = append(nsToClusters[ns], s.Label)
 		}
 	}
-
-	// Only namespaces present in >= 2 clusters can collide.
 	var merged []string
 	for ns, labels := range nsToClusters {
 		if len(labels) >= 2 {
@@ -179,24 +312,66 @@ func main() {
 	}
 	sort.Strings(merged)
 
-	outf("  Namespaces present in >=2 clusters (merge candidates): %d\n\n", len(merged))
+	outf("  Merge-candidate namespaces (in >=2 clusters): %d\n", len(merged))
 	if len(merged) == 0 {
 		outln("  No shared namespaces — nothing can collide. RESULT: PASS (no overlap).")
 		return
 	}
 
-	overlaps := scanAll(ctx, clients, nsToClusters, merged, *mode, *sampleCap, *concurrency)
+	scanAll(ctx, clients, nsToClusters, merged, *mode, *sampleCap, *concurrency, ckpt, resFile)
 
-	outf("\n  ── summary  |  namespaces scanned: %d  |  with overlap: %d ──\n", len(merged), overlaps)
-	if overlaps > 0 {
-		if *mode == "range" {
-			outln("\n  RESULT: OVERLAP CANDIDATES found — intervals intersect. Re-run --mode=exact to confirm real duplicate _ids.")
-		} else {
-			outln("\n  RESULT: OVERLAP found — real duplicate _ids exist across clusters. Decide handling before backfill.")
+	// Final tally from the checkpoint (covers this run + any resumed results).
+	overlaps, scanned := 0, 0
+	for _, ns := range merged {
+		if r := ckpt.get(ns); r != nil && r.Done {
+			scanned++
+			if r.Overlap {
+				overlaps++
+			}
 		}
+	}
+	ckpt.put(&nsResult{NS: "__final__", Done: true}, true) // force a final flush
+
+	summary := fmt.Sprintf("\n  ── summary  |  namespaces scanned: %d/%d  |  with overlap: %d ──\n",
+		scanned, len(merged), overlaps)
+	outf("%s", summary)
+	fmt.Fprint(resFile, summary)
+
+	if overlaps > 0 {
+		msg := "  RESULT: OVERLAP found — see results file. Decide handling before backfill.\n"
+		if *mode == "range" {
+			msg = "  RESULT: OVERLAP CANDIDATES found — intervals intersect. Re-run --mode=exact to confirm.\n"
+		}
+		outf("%s", msg)
+		fmt.Fprint(resFile, msg)
+		outf("\n  Full findings: %s\n", outPath)
 		os.Exit(5)
 	}
-	outln("\n  RESULT: PASS — no _id overlap across merged namespaces.")
+	pass := "  RESULT: PASS — no _id overlap across merged namespaces.\n"
+	outf("%s", pass)
+	fmt.Fprint(resFile, pass)
+	outf("\n  Full findings: %s\n", outPath)
+}
+
+// openResults opens the results log file; truncates + writes a header on a fresh
+// run, appends on resume. Returns whether a header was written.
+func openResults(path string, resume bool, mode string) (*os.File, bool, error) {
+	flags := os.O_CREATE | os.O_WRONLY
+	if resume {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(path, flags, 0644)
+	if err != nil {
+		return nil, false, fmt.Errorf("cannot open results file %q: %w", path, err)
+	}
+	if resume {
+		fmt.Fprintf(f, "\n# ── resumed %s (mode=%s) ──\n", time.Now().Format(time.RFC3339), mode)
+		return f, false, nil
+	}
+	fmt.Fprintf(f, "# id-overlap-scan results  |  mode=%s  |  %s\n\n", mode, time.Now().Format(time.RFC3339))
+	return f, true, nil
 }
 
 func mustConnect(ctx context.Context, uri, label string) *mongo.Client {
@@ -251,45 +426,60 @@ func listNamespaces(ctx context.Context, c *mongo.Client, databases []string) ([
 	return out, nil
 }
 
-// ── Scan driver (parallel over namespaces) ──────────────────────────────────
+// ── Scan driver (parallel over namespaces, resumable) ───────────────────────
 
 func scanAll(ctx context.Context, clients map[string]*mongo.Client, nsToClusters map[string][]string,
-	merged []string, mode string, sampleCap, concurrency int) int {
+	merged []string, mode string, sampleCap, concurrency int, ckpt *checkpointer, resFile *os.File) {
 
-	type job struct{ ns string }
-	jobs := make(chan job, len(merged))
-	var mu sync.Mutex
-	overlaps := 0
+	var writeMu sync.Mutex // serialize console + results-file writes
+	jobs := make(chan string, len(merged))
+	total := len(merged)
+	var doneCount int64
 
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobs {
-				labels := nsToClusters[j.ns]
-				var found bool
-				var report string
+			for ns := range jobs {
+				labels := nsToClusters[ns]
+
+				// Skip namespaces already finished in a previous run.
+				if prev := ckpt.get(ns); prev != nil && prev.Done {
+					writeMu.Lock()
+					doneCount++
+					outf("  [%d/%d] %s — already done (%s)\n", doneCount, total, ns,
+						map[bool]string{true: "OVERLAP", false: "OK"}[prev.Overlap])
+					writeMu.Unlock()
+					continue
+				}
+
+				writeMu.Lock()
+				outf("  [ .. ] scanning %s (%s) ...\n", ns, strings.Join(labels, ","))
+				writeMu.Unlock()
+
+				var res *nsResult
 				if mode == "range" {
-					found, report = scanRange(ctx, clients, j.ns, labels)
+					res = scanRange(ctx, clients, ns, labels)
 				} else {
-					found, report = scanExact(ctx, clients, j.ns, labels, sampleCap)
+					res = scanExact(ctx, clients, ns, labels, sampleCap, ckpt)
 				}
-				mu.Lock()
-				outf("%s", report)
-				if found {
-					overlaps++
-				}
-				mu.Unlock()
+				ckpt.put(res, true) // persist completed namespace immediately
+
+				writeMu.Lock()
+				doneCount++
+				outf("  [%d/%d] %s — %s\n", doneCount, total, ns,
+					map[bool]string{true: fmt.Sprintf("OVERLAP (%d)", res.DupCount), false: "OK"}[res.Overlap])
+				fmt.Fprint(resFile, res.Report)
+				writeMu.Unlock()
 			}
 		}()
 	}
 	for _, ns := range merged {
-		jobs <- job{ns: ns}
+		jobs <- ns
 	}
 	close(jobs)
 	wg.Wait()
-	return overlaps
 }
 
 func splitNS(ns string) (string, string) {
@@ -306,37 +496,34 @@ type rangeInfo struct {
 	empty    bool
 }
 
-func scanRange(ctx context.Context, clients map[string]*mongo.Client, ns string, labels []string) (bool, string) {
+func scanRange(ctx context.Context, clients map[string]*mongo.Client, ns string, labels []string) *nsResult {
 	db, coll := splitNS(ns)
+	res := &nsResult{NS: ns, Clusters: labels, Done: true}
 	var infos []rangeInfo
 	for _, label := range labels {
 		c := clients[label].Database(db).Collection(coll)
-		var sb strings.Builder
 		cnt, err := c.EstimatedDocumentCount(ctx)
 		if err != nil {
-			return false, fmt.Sprintf("  [ERROR] %s (%s): count: %v\n", ns, label, err)
+			res.Report = fmt.Sprintf("  [ERROR] %s (%s): count: %v\n", ns, label, err)
+			return res
 		}
 		info := rangeInfo{label: label, count: cnt}
 		if cnt == 0 {
 			info.empty = true
 			infos = append(infos, info)
-			_ = sb
 			continue
 		}
-		mn, err := edgeID(ctx, c, 1)
-		if err != nil {
-			return false, fmt.Sprintf("  [ERROR] %s (%s): min _id: %v\n", ns, label, err)
+		if info.min, err = edgeID(ctx, c, 1); err != nil {
+			res.Report = fmt.Sprintf("  [ERROR] %s (%s): min _id: %v\n", ns, label, err)
+			return res
 		}
-		mx, err := edgeID(ctx, c, -1)
-		if err != nil {
-			return false, fmt.Sprintf("  [ERROR] %s (%s): max _id: %v\n", ns, label, err)
+		if info.max, err = edgeID(ctx, c, -1); err != nil {
+			res.Report = fmt.Sprintf("  [ERROR] %s (%s): max _id: %v\n", ns, label, err)
+			return res
 		}
-		info.min, info.max = mn, mx
 		infos = append(infos, info)
 	}
 
-	// Pairwise interval intersection: two intervals [aMin,aMax],[bMin,bMax]
-	// intersect iff aMin <= bMax AND bMin <= aMax.
 	var overlapPairs []string
 	for i := 0; i < len(infos); i++ {
 		for j := i + 1; j < len(infos); j++ {
@@ -367,10 +554,11 @@ func scanRange(ctx context.Context, clients map[string]*mongo.Client, ns string,
 	if len(overlapPairs) > 0 {
 		fmt.Fprintf(&sb, "       intersecting intervals: %s\n", strings.Join(overlapPairs, ", "))
 	}
-	return len(overlapPairs) > 0, sb.String()
+	res.Overlap = len(overlapPairs) > 0
+	res.Report = sb.String()
+	return res
 }
 
-// edgeID returns the min (dir=1) or max (dir=-1) _id via an indexed query.
 func edgeID(ctx context.Context, c *mongo.Collection, dir int) (interface{}, error) {
 	opts := options.FindOne().
 		SetSort(bson.D{{Key: "_id", Value: dir}}).
@@ -384,7 +572,7 @@ func edgeID(ctx context.Context, c *mongo.Collection, dir int) (interface{}, err
 	return doc.ID, nil
 }
 
-// ── Exact mode (streaming k-way merge) ──────────────────────────────────────
+// ── Exact mode (streaming k-way merge, resumable via _id watermark) ──────────
 
 type idHead struct {
 	label string
@@ -408,23 +596,42 @@ func (h *idHead) advance(ctx context.Context) error {
 	return h.cur.Err()
 }
 
-func scanExact(ctx context.Context, clients map[string]*mongo.Client, ns string, labels []string, sampleCap int) (bool, string) {
+func scanExact(ctx context.Context, clients map[string]*mongo.Client, ns string, labels []string,
+	sampleCap int, ckpt *checkpointer) *nsResult {
+
 	db, coll := splitNS(ns)
-	opts := options.Find().
+
+	// Resume state: continue from the last checkpointed watermark if present.
+	res := &nsResult{NS: ns, Clusters: labels}
+	filter := bson.D{}
+	if prev := ckpt.get(ns); prev != nil && !prev.Done {
+		res.DupCount = prev.DupCount
+		res.Samples = append([]string(nil), prev.Samples...)
+		res.Watermark = prev.Watermark
+		if wm, ok := unmarshalWatermark(prev.Watermark); ok {
+			filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: wm}}}}
+		}
+	}
+
+	findOpts := options.Find().
 		SetSort(bson.D{{Key: "_id", Value: 1}}).
 		SetProjection(bson.D{{Key: "_id", Value: 1}}).
 		SetBatchSize(2000)
 
 	var heads []*idHead
 	for _, label := range labels {
-		cur, err := clients[label].Database(db).Collection(coll).Find(ctx, bson.D{}, opts)
+		cur, err := clients[label].Database(db).Collection(coll).Find(ctx, filter, findOpts)
 		if err != nil {
-			return false, fmt.Sprintf("  [ERROR] %s (%s): find: %v\n", ns, label, err)
+			res.Done = true
+			res.Report = fmt.Sprintf("  [ERROR] %s (%s): find: %v\n", ns, label, err)
+			return res
 		}
 		h := &idHead{label: label, cur: cur}
 		if err := h.advance(ctx); err != nil {
 			cur.Close(ctx)
-			return false, fmt.Sprintf("  [ERROR] %s (%s): read: %v\n", ns, label, err)
+			res.Done = true
+			res.Report = fmt.Sprintf("  [ERROR] %s (%s): read: %v\n", ns, label, err)
+			return res
 		}
 		heads = append(heads, h)
 	}
@@ -434,18 +641,12 @@ func scanExact(ctx context.Context, clients map[string]*mongo.Client, ns string,
 		}
 	}()
 
-	var dupCount int64
-	var samples []string
-	// k-way merge: repeatedly take the minimum live head value; if >=2 heads
-	// share it, that _id exists in multiple clusters => a real collision.
+	var sinceCheckpoint int
 	for {
 		var minVal interface{}
 		haveMin := false
 		for _, h := range heads {
-			if !h.live {
-				continue
-			}
-			if !haveMin || cmpVal(h.val, minVal) < 0 {
+			if h.live && (!haveMin || cmpVal(h.val, minVal) < 0) {
 				minVal, haveMin = h.val, true
 			}
 		}
@@ -459,40 +660,63 @@ func scanExact(ctx context.Context, clients map[string]*mongo.Client, ns string,
 			}
 		}
 		if len(owners) >= 2 {
-			dupCount++
-			if len(samples) < sampleCap {
-				samples = append(samples, fmt.Sprintf("%s in [%s]", fmtID(minVal), strings.Join(owners, ",")))
+			res.DupCount++
+			if len(res.Samples) < sampleCap {
+				res.Samples = append(res.Samples, fmt.Sprintf("%s in [%s]", fmtID(minVal), strings.Join(owners, ",")))
 			}
 		}
-		// advance every head equal to the min.
+		// Advance every head sitting on the minimum, then record the watermark
+		// (minVal is now fully processed). Persist periodically.
 		for _, h := range heads {
 			if h.live && cmpVal(h.val, minVal) == 0 {
 				if err := h.advance(ctx); err != nil {
-					return dupCount > 0, fmt.Sprintf("  [ERROR] %s (%s): stream: %v\n", ns, h.label, err)
+					res.Done = false
+					res.Report = fmt.Sprintf("  [ERROR] %s: stream: %v\n", ns, err)
+					return res
 				}
 			}
 		}
+		res.Watermark = marshalWatermark(minVal)
+		sinceCheckpoint++
+		if sinceCheckpoint >= exactCheckpointEveryN {
+			sinceCheckpoint = 0
+			ckpt.put(snapshotPartial(res), false) // throttled disk write
+		}
 	}
 
+	res.Done = true
+	res.Watermark = nil // completed; no resume point needed
+	res.Overlap = res.DupCount > 0
+	res.Report = renderExactReport(res)
+	return res
+}
+
+// snapshotPartial returns a not-done copy for mid-namespace checkpointing.
+func snapshotPartial(r *nsResult) *nsResult {
+	cp := *r
+	cp.Done = false
+	cp.Samples = append([]string(nil), r.Samples...)
+	return &cp
+}
+
+func renderExactReport(res *nsResult) string {
 	var sb strings.Builder
-	if dupCount == 0 {
-		fmt.Fprintf(&sb, "  [OK      ] %s  (%s) — no shared _ids\n", ns, strings.Join(labels, ","))
-		return false, sb.String()
+	if res.DupCount == 0 {
+		fmt.Fprintf(&sb, "  [OK      ] %s  (%s) — no shared _ids\n", res.NS, strings.Join(res.Clusters, ","))
+		return sb.String()
 	}
-	fmt.Fprintf(&sb, "  [OVERLAP ] %s  (%s) — %d shared _id(s)\n", ns, strings.Join(labels, ","), dupCount)
-	for _, s := range samples {
+	fmt.Fprintf(&sb, "  [OVERLAP ] %s  (%s) — %d shared _id(s)\n", res.NS, strings.Join(res.Clusters, ","), res.DupCount)
+	for _, s := range res.Samples {
 		fmt.Fprintf(&sb, "       %s\n", s)
 	}
-	if dupCount > int64(len(samples)) {
-		fmt.Fprintf(&sb, "       ... and %d more (raise --sample to see)\n", dupCount-int64(len(samples)))
+	if res.DupCount > int64(len(res.Samples)) {
+		fmt.Fprintf(&sb, "       ... and %d more (raise --sample to see)\n", res.DupCount-int64(len(res.Samples)))
 	}
-	return true, sb.String()
+	return sb.String()
 }
 
 // ── BSON value comparison ───────────────────────────────────────────────────
 
-// typeRank orders _id values by BSON type first (subset covering common _id
-// types), matching MongoDB's cross-type sort order closely enough for merge.
 func typeRank(v interface{}) int {
 	switch v.(type) {
 	case nil:
@@ -526,8 +750,6 @@ func asFloat(v interface{}) float64 {
 	return 0
 }
 
-// cmpVal returns -1/0/1. Same-type values compare by value; different types by
-// BSON type rank; unknown types fall back to canonical string comparison.
 func cmpVal(a, b interface{}) int {
 	ra, rb := typeRank(a), typeRank(b)
 	if ra != rb {
