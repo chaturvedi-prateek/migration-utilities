@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate one source-connector JSON per cluster from sources.json + the template.
 #
-# Requires: jq
+# Requires: python3 (literal templating + JSON validation; no jq/sed escaping games)
 # Usage:    ./generate-sources.sh [sources.json]
 # Output:   source/generated/mongo-source-<label>.json  (one per cluster)
 #
@@ -9,45 +9,59 @@
 # "databases" list. Same-name collections across clusters share topic cdc.<db>.<coll>
 # (same topic.prefix in the template) so they MERGE into one target collection.
 set -euo pipefail
-
 cd "$(dirname "$0")"
+
 SRC_FILE="${1:-sources.json}"
 TEMPLATE="source/mongo-source.template.json"
 OUT_DIR="source/generated"
 
-command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "ERROR: python3 is required" >&2; exit 1; }
 [ -f "$SRC_FILE" ] || { echo "ERROR: $SRC_FILE not found (copy sources.sample.json)" >&2; exit 1; }
+[ -f "$TEMPLATE" ] || { echo "ERROR: $TEMPLATE not found" >&2; exit 1; }
 
-mkdir -p "$OUT_DIR"
-count=$(jq '.sources | length' "$SRC_FILE")
-echo "Generating $count source connector configs from $SRC_FILE ..."
+SRC_FILE="$SRC_FILE" TEMPLATE="$TEMPLATE" OUT_DIR="$OUT_DIR" python3 - <<'PY'
+import json, os, sys, re
 
-for i in $(seq 0 $((count - 1))); do
-  label=$(jq -r ".sources[$i].label" "$SRC_FILE")
-  uri=$(jq -r ".sources[$i].uri" "$SRC_FILE")
+src_file = os.environ["SRC_FILE"]
+template = os.environ["TEMPLATE"]
+out_dir  = os.environ["OUT_DIR"]
 
-  # dbs = ["juno","orders"]  ->  regex "(juno|orders)\\..*"  and  $match on ns.db $in [...]
-  db_alt=$(jq -r ".sources[$i].databases | join(\"|\")" "$SRC_FILE")
-  # JSON string needs a literal backslash-dot; in bash double quotes "\\\\" => "\\".
-  ns_regex="($db_alt)\\\\..*"
-  pipeline=$(jq -c ".sources[$i].databases | [{\"\$match\": {\"ns.db\": {\"\$in\": .}}}]" "$SRC_FILE")
-  # escape inner double-quotes for embedding as a JSON string value: " => \"
-  pipeline_escaped=${pipeline//\"/\\\"}
+with open(template) as f:
+    tpl = f.read()
+with open(src_file) as f:
+    sources = json.load(f)["sources"]
 
-  # Render via bash literal substitution (${var//find/replace}) — no backslash
-  # reinterpretation, unlike sed, so JSON escapes survive intact.
-  out_content="$TEMPLATE_BODY"
-  out_content=${out_content//__LABEL__/$label}
-  out_content=${out_content//__SOURCE_URI__/$uri}
-  out_content=${out_content//__NS_REGEX__/$ns_regex}
-  out_content=${out_content//__PIPELINE__/$pipeline_escaped}
+os.makedirs(out_dir, exist_ok=True)
+print(f"Generating {len(sources)} source connector configs from {src_file} ...")
 
-  out="$OUT_DIR/mongo-source-$label.json"
-  printf '%s\n' "$out_content" > "$out"
+for s in sources:
+    label = s["label"]
+    uri   = s["uri"]
+    dbs   = s["databases"]
 
-  # sanity: valid JSON?
-  jq empty "$out" || { echo "ERROR: generated invalid JSON for $label" >&2; exit 1; }
-  echo "  wrote $out"
-done
+    # regex: (db1|db2)\..*   — JSON-escaped so the file literally contains \\.
+    ns_regex = "(" + "|".join(re.escape(d) for d in dbs) + ")\\..*"
+    # change-stream pipeline as a JSON string value inside the connector config
+    pipeline = json.dumps([{"$match": {"ns.db": {"$in": dbs}}}])
 
-echo "Done. Register with:  ./manage.sh register-sources"
+    # json.dumps(...)[1:-1] gives the properly-escaped INNER contents of a JSON
+    # string (backslashes/quotes handled), which we drop into the "..." slots.
+    def js(v): return json.dumps(v)[1:-1]
+
+    body = (tpl.replace("__LABEL__", js(label))
+               .replace("__SOURCE_URI__", js(uri))
+               .replace("__NS_REGEX__", js(ns_regex))
+               .replace("__PIPELINE__", js(pipeline)))
+
+    out = os.path.join(out_dir, f"mongo-source-{label}.json")
+    try:
+        json.loads(body)  # validate
+    except json.JSONDecodeError as e:
+        print(f"ERROR: generated invalid JSON for {label}: {e}", file=sys.stderr)
+        sys.exit(1)
+    with open(out, "w") as f:
+        f.write(body + "\n")
+    print(f"  wrote {out}")
+
+print("Done. Register with:  ./manage.sh register-sources")
+PY
