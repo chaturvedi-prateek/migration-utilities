@@ -37,6 +37,29 @@ confirm and list the real duplicates.
 
 ---
 
+## Output & resumability
+
+- **Findings go to a results log file** (`--out`), not the shell. The console
+  shows only per-namespace progress and the final summary; the full
+  per-namespace blocks (including sample colliding `_id`s) are written to the
+  file. Default path: `config.log_file`, else `overlap-report.<mode>.log`.
+- **Resumable.** Progress is checkpointed to a JSON file (`--checkpoint`,
+  default `<out>.checkpoint.json`) written atomically:
+  - after **every namespace** (both modes), and
+  - **within** a namespace in `exact` mode — periodically persisting an `_id`
+    **watermark** (every ~100k merged `_id`s / ≥5 s).
+
+  If the run is killed or dies, just re-run the same command: finished
+  namespaces are skipped, and a half-scanned `exact` namespace continues from
+  its watermark (cursors resume at `_id > watermark`) instead of restarting.
+  The results file is appended to on resume (a `# resumed …` marker is added).
+  Use `--restart` to ignore an existing checkpoint and start fresh.
+
+  A checkpoint records its `mode`; resuming with a different `--mode` is
+  rejected (use `--restart` or a separate `--checkpoint`).
+
+---
+
 ## Setup
 
 ```bash
@@ -67,11 +90,17 @@ Same `sources` shape as `../kafkaConnectors/sources.json` and
 ## Usage
 
 ```bash
-# Fast candidate pass
+# Fast candidate pass (findings -> overlap-report.range.log)
 ./bin/idOverlapScan-linux-amd64 --config config.json --mode=range
 
-# Confirm real duplicate _ids (and list samples)
-./bin/idOverlapScan-linux-amd64 --config config.json --mode=exact --sample=50
+# Confirm real duplicate _ids (findings -> results.log; resumable)
+./bin/idOverlapScan-linux-amd64 --config config.json --mode=exact --sample=50 --out results.log
+
+# If it was killed, just run the SAME command again — it resumes from the checkpoint.
+./bin/idOverlapScan-linux-amd64 --config config.json --mode=exact --sample=50 --out results.log
+
+# Force a clean start, ignoring any checkpoint
+./bin/idOverlapScan-linux-amd64 --config config.json --mode=exact --out results.log --restart
 ```
 
 ### Flags
@@ -80,8 +109,11 @@ Same `sources` shape as `../kafkaConnectors/sources.json` and
 | --- | --- | --- |
 | `--config` | `config.json` | Path to the JSON config file. |
 | `--mode` | `range` | `range` \| `exact`. |
-| `--sample` | `20` | Max duplicate `_id`s printed per namespace (exact mode). |
+| `--sample` | `20` | Max duplicate `_id`s recorded per namespace (exact mode). |
 | `--concurrency` | `4` | Namespaces scanned in parallel. |
+| `--out` | `config.log_file` else `overlap-report.<mode>.log` | Results log file (findings go here, not the shell). |
+| `--checkpoint` | `<out>.checkpoint.json` | Resume checkpoint file. |
+| `--restart` | `false` | Ignore any existing checkpoint and start fresh. |
 
 ---
 
