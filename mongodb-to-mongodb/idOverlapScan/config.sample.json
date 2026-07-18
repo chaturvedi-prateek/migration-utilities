@@ -1,0 +1,10 @@
+{
+  "//": "Pre-flight _id overlap scanner. Same sources format as the connectors/index tools.",
+  "//uri": "Point reads at HIDDEN nodes so the scan never touches production primaries.",
+  "//dbs": "'databases' (optional) limits which DBs are scanned; [] = all non-system.",
+  "sources": [
+    { "label": "cluster01", "uri": "mongodb://user:pass@rs01-a:27017/?replicaSet=rs01&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_a", "db_b"] },
+    { "label": "cluster02", "uri": "mongodb://user:pass@rs02-a:27017/?replicaSet=rs02&readPreference=secondary&readPreferenceTags=nodeType:hidden&ssl=true&authSource=admin", "databases": ["db_a", "db_c"] }
+  ],
+  "log_file": ""
+}
