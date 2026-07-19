@@ -1,0 +1,47 @@
+{
+  "//PURPOSE": "REVERSE pipeline sink: apply Atlas changes to the self-managed target,",
+  "//PURPOSE2": "preserving namespaces (db.coll -> same db.coll). No merge on rollback —",
+  "//PURPOSE3": "it's one Atlas -> one target, so upsert/last-writer-wins is correct.",
+  "name": "rollback-sink-selfmanaged",
+  "config": {
+    "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
+    "tasks.max": "8",
+
+    "connection.uri": "mongodb://user:pass@mongos-target.internal:27017/?authSource=admin",
+
+    "topics.regex": "rb\\..*",
+
+    "//ns": "Route each event to its original <ns.db>.<ns.coll> on the target.",
+    "namespace.mapper": "com.mongodb.kafka.connect.sink.namespace.mapping.FieldPathNamespaceMapper",
+    "namespace.mapper.value.database.field": "ns.db",
+    "namespace.mapper.value.collection.field": "ns.coll",
+    "namespace.mapper.error.if.invalid": "true",
+    "database": "default_db_placeholder",
+    "collection": "default_coll_placeholder",
+
+    "//cdc": "Apply insert/update/replace/delete idempotently by _id.",
+    "change.data.capture.handler": "com.mongodb.kafka.connect.sink.cdc.mongodb.ChangeStreamHandler",
+    "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.FullKeyStrategy",
+    "document.id.strategy.overwrite.existing": "true",
+    "delete.on.null.values": "false",
+
+    "max.batch.size": "3000",
+    "bulk.write.ordered": "false",
+    "max.num.retries": "5",
+    "retries.defer.timeout": "5000",
+
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "errors.deadletterqueue.topic.name": "dlq.rollback.sink",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.deadletterqueue.topic.replication.factor": "3",
+
+    "consumer.override.auto.offset.reset": "earliest",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
