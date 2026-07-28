@@ -10,27 +10,28 @@ import (
 	"time"
 )
 
-// pidFilePath is where `sync` records the PIDs of the mongosync processes it leaves
-// running, so a later `commit`/`stop` can terminate them.
-func pidFilePath(cfg *Config) string {
-	return filepath.Join(cfg.LogDir, "mongosync.pids")
+// pidFilePath is where a parallel/hold step records the PIDs of the mongosync
+// processes it leaves running, so a later `commit`/`stop` can terminate them. The
+// path is scoped per step so multiple held steps don't collide.
+func pidFilePath(cfg *Config, step string) string {
+	return filepath.Join(cfg.LogDir, "mongosync."+step+".pids")
 }
 
-// writePidFile records "id port pid" for each running instance.
-func writePidFile(cfg *Config, instances []*instance) error {
+// writePidFile records "id port pid" for each running instance of a step.
+func writePidFile(cfg *Config, step string, instances []*instance) error {
 	var b strings.Builder
 	for _, in := range instances {
 		if in.cmd != nil && in.cmd.Process != nil {
 			fmt.Fprintf(&b, "%s %d %d\n", in.id, in.port, in.cmd.Process.Pid)
 		}
 	}
-	return os.WriteFile(pidFilePath(cfg), []byte(b.String()), 0o644)
+	return os.WriteFile(pidFilePath(cfg, step), []byte(b.String()), 0o644)
 }
 
 // stopByPidFile SIGTERMs every recorded PID (SIGKILL if it lingers), then removes
 // the pid file. Missing file is not an error.
-func stopByPidFile(cfg *Config) error {
-	path := pidFilePath(cfg)
+func stopByPidFile(cfg *Config, step string) error {
+	path := pidFilePath(cfg, step)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

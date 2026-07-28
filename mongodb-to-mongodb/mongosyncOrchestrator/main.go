@@ -1,13 +1,18 @@
-// mongosyncOrchestrator drives many mongosync instances from a single migration
-// host: Phase 1 runs N 1:1 cluster syncs in parallel; Phase 2 consolidates them
-// into one hub cluster sequentially (mongosync forbids many-to-one, so merges are
-// one-at-a-time with the hub's mongosync metadata cleaned between runs).
+// mongosyncOrchestrator drives many mongosync instances from a single host using a
+// generic plan of steps. Each step is a group of mongosync "jobs" run either in
+// parallel (1:1 lift waves) or sequentially (fan-in / consolidation), with per-job
+// namespace filtering, preExistingDestinationData, metadata cleanup, and verify.
+//
+// "10→10→1" is just a two-step plan: a parallel/hold step of 10 jobs, then a
+// sequential/auto step of 9 preExisting+cleanup jobs. The legacy syncs[]/
+// consolidation config is still accepted and translated into an equivalent plan.
 //
 // Usage:
 //
-//	mongosyncOrchestrator sync        --config c.json [--commit] [--dry-run]
-//	mongosyncOrchestrator consolidate --config c.json [--verify]  [--dry-run]
-//	mongosyncOrchestrator progress    --config c.json
+//	mongosyncOrchestrator run    --config c.json --step <name> [--dry-run]
+//	mongosyncOrchestrator commit --config c.json [--step <name>]
+//	mongosyncOrchestrator stop   --config c.json [--step <name>] [--force]
+//	mongosyncOrchestrator sync|consolidate|progress|pause|resume ...   (legacy)
 package main
 
 import (
@@ -28,11 +33,12 @@ func main() {
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	configPath := fs.String("config", "orchestrator.json", "path to orchestrator config JSON")
-	commit := fs.Bool("commit", false, "auto-commit each sync once drained (Phase 1)")
-	verify := fs.Bool("verify", false, "run count verification after each merge (Phase 2)")
-	embeddedVerify := fs.Bool("embedded-verify", false, "enable mongosync's built-in verifier on each sync")
+	step := fs.String("step", "", "plan step to act on (by name)")
+	commit := fs.Bool("commit", false, "auto-commit each job once drained (parallel step)")
+	verify := fs.Bool("verify", false, "run count verification after each job (sequential step)")
+	embeddedVerify := fs.Bool("embedded-verify", false, "enable mongosync's built-in verifier on each job")
 	dryRun := fs.Bool("dry-run", false, "print the plan without launching mongosync")
-	force := fs.Bool("force", false, "commit even if some syncs are not fully drained")
+	force := fs.Bool("force", false, "skip readiness/COMMITTED waits (commit/stop)")
 	pollSecs := fs.Int("poll", 15, "progress poll interval in seconds")
 	lag := fs.Float64("lag", 5, "max lagTimeSeconds considered drained/ready to commit")
 	_ = fs.Parse(os.Args[2:])
@@ -50,43 +56,75 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	poll := time.Duration(*pollSecs) * time.Second
+	opts := stepOpts{poll: time.Duration(*pollSecs) * time.Second, lag: *lag, force: *force, embeddedVerify: *embeddedVerify}
 
 	switch cmd {
-	case "sync":
-		if *dryRun {
-			dryRunSync(cfg)
-			return
-		}
-		if err := runSync(ctx, cfg, *commit, *embeddedVerify, poll, *lag); err != nil {
+	case "run":
+		st, err := cfg.findStep(*step)
+		if err != nil {
 			fatal(err)
 		}
-	case "consolidate":
+		s := *st
+		s.Verify = s.Verify || *verify
+		if *commit && s.Mode == modeParallel {
+			s.Commit = commitAuto
+		}
 		if *dryRun {
-			dryRunConsolidate(cfg)
+			dryRunStep(cfg, &s)
 			return
 		}
-		if err := runConsolidate(ctx, cfg, poll, *lag, *verify, *embeddedVerify); err != nil {
+		if err := runStep(ctx, cfg, &s, opts); err != nil {
+			fatal(err)
+		}
+
+	case "sync": // legacy: first parallel step
+		if *dryRun {
+			dryRunByMode(cfg, modeParallel)
+			return
+		}
+		if err := runSync(ctx, cfg, *commit, *embeddedVerify, opts.poll, *lag); err != nil {
+			fatal(err)
+		}
+	case "consolidate": // legacy: first sequential step
+		if *dryRun {
+			dryRunByMode(cfg, modeSequential)
+			return
+		}
+		if err := runConsolidate(ctx, cfg, opts.poll, *lag, *verify, *embeddedVerify); err != nil {
 			fatal(err)
 		}
 	case "commit":
-		if err := runCommit(ctx, cfg, *lag, *force); err != nil {
+		st, err := cfg.firstStepByMode(*step, modeParallel)
+		if err != nil {
+			fatal(err)
+		}
+		if err := commitStep(ctx, cfg, st, *lag, *force); err != nil {
 			fatal(err)
 		}
 	case "stop":
-		if err := runStop(ctx, cfg, *force); err != nil {
+		st, err := cfg.firstStepByMode(*step, modeParallel)
+		if err != nil {
+			fatal(err)
+		}
+		if err := stopStep(ctx, cfg, st, *force); err != nil {
 			fatal(err)
 		}
 	case "progress":
-		if err := progressOnce(ctx, cfg); err != nil {
+		st, err := resolveStepAny(cfg, *step)
+		if err != nil {
+			fatal(err)
+		}
+		if err := progressStep(ctx, cfg, st); err != nil {
 			fatal(err)
 		}
 	case "pause", "resume":
-		if err := pauseResume(ctx, cfg, cmd == "pause"); err != nil {
+		st, err := resolveStepAny(cfg, *step)
+		if err != nil {
 			fatal(err)
 		}
-	case "-h", "--help", "help":
-		usage()
+		if err := pauseResumeStep(ctx, cfg, st, cmd == "pause"); err != nil {
+			fatal(err)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		usage()
@@ -94,81 +132,56 @@ func main() {
 	}
 }
 
-// progressOnce attaches to already-running instances (by their known ports) and
-// prints a single aggregated snapshot.
-func progressOnce(ctx context.Context, cfg *Config) error {
-	instances := make([]*instance, len(cfg.Syncs))
-	for i, s := range cfg.Syncs {
-		instances[i] = &instance{id: s.ID, port: cfg.portFor(i), cfg: cfg}
+// resolveStepAny returns the named step, or the first step in the plan if unnamed.
+func resolveStepAny(cfg *Config, name string) (*Step, error) {
+	if name != "" {
+		return cfg.findStep(name)
 	}
-	renderTable(pollAll(ctx, instances))
-	return nil
+	return &cfg.plan().Steps[0], nil
 }
 
-// pauseResume pauses or resumes every configured sync (by its known port). Useful
-// for throttling source load or holding all syncs during a maintenance window.
-func pauseResume(ctx context.Context, cfg *Config, doPause bool) error {
-	action := "resume"
-	if doPause {
-		action = "pause"
-	}
-	var firstErr error
-	for i, s := range cfg.Syncs {
-		in := &instance{id: s.ID, port: cfg.portFor(i), cfg: cfg}
-		var err error
-		if doPause {
-			err = in.pause(ctx)
-		} else {
-			err = in.resume(ctx)
-		}
-		if err != nil {
-			fmt.Printf("[%s] %s: %v\n", s.ID, action, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		fmt.Printf("[%s] %sd\n", s.ID, action)
-	}
-	return firstErr
-}
-
-func dryRunSync(cfg *Config) {
-	fmt.Printf("DRY RUN — Phase 1: %d parallel 1:1 syncs\n", len(cfg.Syncs))
-	for i, s := range cfg.Syncs {
-		fmt.Printf("  [%s] port=%d\n     cluster0(src)=%s\n     cluster1(dst)=%s\n     includeNamespaces=%v\n",
-			s.ID, cfg.portFor(i), redact(s.Source), redact(s.Destination), s.IncludeNamespaces)
-	}
-}
-
-func dryRunConsolidate(cfg *Config) {
-	if cfg.Consolidation == nil {
-		fmt.Println("no consolidation section in config")
+func dryRunByMode(cfg *Config, mode string) {
+	st, err := cfg.firstStepByMode("", mode)
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
-	fmt.Printf("DRY RUN — Phase 2: %d sequential merges into hub\n  hub=%s\n",
-		len(cfg.Consolidation.Merges), redact(cfg.Consolidation.Hub))
-	for i, m := range cfg.Consolidation.Merges {
-		fmt.Printf("  step %d [%s] port=%d preExistingDestinationData=true\n     source=%s\n     includeNamespaces=%v\n",
-			i+1, m.ID, cfg.portFor(0), redact(m.Source), m.IncludeNamespaces)
+	dryRunStep(cfg, st)
+}
+
+func dryRunStep(cfg *Config, st *Step) {
+	fmt.Printf("DRY RUN — step %q: mode=%s commit=%s verify=%v (%d jobs)\n",
+		st.Name, st.Mode, st.Commit, st.Verify, len(st.Jobs))
+	for i, j := range st.Jobs {
+		port := cfg.portFor(i)
+		if st.Mode == modeSequential {
+			port = cfg.portFor(0)
+		}
+		fmt.Printf("  [%s] port=%d preExisting=%v cleanup=%v\n     source=%s\n     destination=%s\n     includeNamespaces=%v\n",
+			j.ID, port, j.PreExistingDestinationData, j.CleanupMetadataOn,
+			redact(j.Source), redact(j.Destination), j.IncludeNamespaces)
 	}
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `mongosyncOrchestrator — drive many mongosync from one host
+	fmt.Fprint(os.Stderr, `mongosyncOrchestrator — drive many mongosync from one host via a plan of steps
 
-  sync         Phase 1: launch all 1:1 syncs in parallel; without --commit,
-               run to steady state and LEAVE them running for a coordinated commit
-  commit       Phase 1 cutover: commit all syncs together, wait for canWrite
-               (apps may cut over); does NOT stop mongosync
-  stop         wait for COMMITTED (index builds done) then stop the syncs (--force
-               to skip the wait); frees ports for consolidation
-  consolidate  Phase 2: merge sources into the hub sequentially
-  progress     print one aggregated progress snapshot of running syncs
-  pause        pause all running syncs
-  resume       resume all paused syncs
+Generic:
+  run          execute one plan step (--step); parallel or sequential per its config
+  commit       cutover a held parallel step: commit all jobs, wait canWrite (--step)
+  stop         wait COMMITTED then stop a held step's jobs (--step, --force)
+  progress     print an aggregated progress snapshot of a step's jobs (--step)
+  pause|resume pause/resume a step's jobs (--step)
 
-Flags: --config --commit --verify --embedded-verify --force --dry-run --poll --lag
+Legacy (map onto the first parallel / sequential step of the plan):
+  sync         run the parallel step to steady state (--commit for all-in-one)
+  consolidate  run the sequential step (fan-in)
+
+Flags: --config --step --commit --verify --embedded-verify --force --dry-run --poll --lag
+
+A step is: { name, mode: parallel|sequential, commit: hold|auto, verify, jobs[] }.
+A job is:  { id, source, destination, includeNamespaces?, preExistingDestinationData?,
+             cleanupMetadataOn?: [source|destination], embeddedVerify? }.
 `)
 }
 
