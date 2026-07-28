@@ -18,7 +18,7 @@
     "change.stream.full.document": "updateLookup",
     "publish.full.document.only": "false",
 
-    "//topics": "SAME topic.prefix across ALL 10 sources so same db.coll from every",
+    "//topics": "SAME topic.prefix across ALL sources so same db.coll from every",
     "//topics2": "cluster lands on ONE topic (cdc.<db>.<coll>) => collections MERGE.",
     "topic.prefix": "cdc",
 

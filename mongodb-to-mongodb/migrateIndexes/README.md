@@ -3,7 +3,7 @@
 Go tool that migrates indexes from **many** self-managed MongoDB source clusters
 to a **single** MongoDB Atlas destination, **merging** same-namespace collections.
 It is the multi-source sibling of `docdb-to-mongodb/indexes/migrateIndexes`,
-built for the 10-cluster → 1-Atlas consolidation where same-name collections
+built for an M-cluster → 1-Atlas consolidation where same-name collections
 combine and therefore their indexes combine too.
 
 Because collections merge, two sources can define the **same `db.collection`
