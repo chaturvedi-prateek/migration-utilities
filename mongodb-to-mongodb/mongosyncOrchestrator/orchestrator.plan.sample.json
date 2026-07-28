@@ -1,0 +1,41 @@
+{
+  // Generic plan config. A plan is an ordered list of steps; each step is a group
+  // of mongosync "jobs" run in parallel or sequentially. "10->10->1" is just a
+  // parallel/hold lift step followed by a sequential/auto consolidate step.
+  "mongosyncBinary": "mongosync",
+  "mongoshBinary": "mongosh",
+  "logDir": "./logs",
+  "basePort": 27182,
+
+  "plan": {
+    "steps": [
+      {
+        "name": "lift",
+        "mode": "parallel",       // launch all jobs at once (ports basePort+i)
+        "commit": "hold",         // run to steady state and LEAVE running for cutover
+        "jobs": [
+          { "id": "cluster01",
+            "source": "mongodb://<user>:<pwd>@<src01>:27017/?replicaSet=<rs01>&authSource=admin",
+            "destination": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_a" } ] }
+          // ... one job per source cluster
+        ]
+      },
+      {
+        "name": "consolidate",
+        "mode": "sequential",     // one job at a time (fan-in)
+        "commit": "auto",         // commit + stop each job before the next
+        "verify": true,           // count-check source vs destination per job
+        "jobs": [
+          { "id": "merge-cluster02",
+            "source": "mongodb+srv://<user>:<pwd>@<atlas02>.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_b" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ] }
+          // ... one job per remaining cluster, all targeting the hub
+        ]
+      }
+    ]
+  }
+}

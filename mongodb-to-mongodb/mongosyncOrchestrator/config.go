@@ -45,8 +45,11 @@ type Config struct {
 	MongoshBinary   string         `json:"mongoshBinary"`   // used for metadata cleanup + verify
 	LogDir          string         `json:"logDir"`
 	BasePort        int            `json:"basePort"` // first mongosync API port; jobs use base+index
-	Syncs           []SyncJob      `json:"syncs"`
-	Consolidation   *Consolidation `json:"consolidation,omitempty"`
+	Plan            *Plan          `json:"plan,omitempty"`
+	// Legacy config shape — still supported. When Plan is nil these are translated
+	// into an equivalent Plan (see plan.go).
+	Syncs         []SyncJob      `json:"syncs,omitempty"`
+	Consolidation *Consolidation `json:"consolidation,omitempty"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -81,6 +84,9 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
+	if c.Plan != nil {
+		return c.Plan.validate()
+	}
 	seen := map[string]bool{}
 	for i, s := range c.Syncs {
 		if s.ID == "" {
