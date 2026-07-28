@@ -1,0 +1,43 @@
+{
+  // Path or PATH name of the mongosync binary (x86_64 Linux/macOS only).
+  "mongosyncBinary": "mongosync",
+  // mongosh is used for metadata cleanup + verification counts during Phase 2.
+  "mongoshBinary": "mongosh",
+  "logDir": "./logs",
+  // First mongosync control-API port; job N uses basePort+N.
+  "basePort": 27182,
+
+  // Phase 1 — lift each source cluster to its own dedicated destination, 1:1,
+  // all in parallel on this single host. Scope with includeNamespaces per cluster.
+  "syncs": [
+    {
+      "id": "cluster01",
+      "source": "mongodb://<user>:<pwd>@<src01-host>:27017/?replicaSet=<rs01>&authSource=admin",
+      "destination": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+      "includeNamespaces": [ { "database": "db_a" } ]
+    },
+    {
+      "id": "cluster02",
+      "source": "mongodb://<user>:<pwd>@<src02-host>:27017/?replicaSet=<rs02>&authSource=admin",
+      "destination": "mongodb+srv://<user>:<pwd>@<atlas02>.xxxxx.mongodb.net/?retryWrites=true",
+      "includeNamespaces": [ { "database": "db_b" } ]
+    }
+    // ... one entry per source cluster (up to 10)
+  ],
+
+  // Phase 2 — sequential fan-in of every Phase-1 destination into a single hub
+  // (one of the destinations, sized as the end-state cluster). mongosync forbids
+  // many-to-one, so merges run one at a time and the tool drops the mongosync
+  // metadata DBs on both ends between merges. Namespaces MUST be disjoint.
+  "consolidation": {
+    "hub": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+    "merges": [
+      {
+        "id": "merge-cluster02",
+        "source": "mongodb+srv://<user>:<pwd>@<atlas02>.xxxxx.mongodb.net/?retryWrites=true",
+        "includeNamespaces": [ { "database": "db_b" } ]
+      }
+      // ... one entry per remaining destination cluster
+    ]
+  }
+}

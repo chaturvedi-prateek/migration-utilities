@@ -8,7 +8,7 @@
 
     "connection.uri": "mongodb+srv://user:pass@atlas-gcp.mongodb.net/?retryWrites=true&w=majority",
 
-    "//topics": "Consume every merged CDC topic produced by the 10 source connectors.",
+    "//topics": "Consume every merged CDC topic produced by the source connectors.",
     "topics.regex": "cdc\\..*",
 
     "//merge": "Route each event to target <ns.db>.<ns.coll>. Same-name collections",

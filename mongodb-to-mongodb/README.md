@@ -1,9 +1,17 @@
-# MongoDB → MongoDB Migration Playbook (many clusters → one Atlas cluster)
+# MongoDB → MongoDB Migration Playbook (M source clusters → 1 Atlas cluster)
 
-End-to-end runbook for consolidating **N self-managed source clusters** into a
-**single MongoDB Atlas cluster**, using Kafka + the MongoDB Kafka connectors for
-**full copy + continuous CDC**, **merging** same-name collections, at high
-throughput, with **zero-downtime** cutover and a **rollback** path.
+End-to-end runbook for consolidating **any number (M) of self-managed source
+clusters** into a **single MongoDB Atlas cluster**, using Kafka + the MongoDB
+Kafka connectors for **full copy + continuous CDC**, **merging** same-name
+collections, at high throughput, with **zero-downtime** cutover and a
+**rollback** path.
+
+**Applicability — generic M → 1.** Nothing here is hardcoded to a specific
+cluster count. M is driven entirely by the entries in your `sources.json`; every
+tool and the connector generator loop over that list, so the same steps work for
+2, 10, or 50 sources. Hosting details in examples (Atlas on GCP, on-prem
+sources, hidden nodes, 5-node target) are illustrative — swap them for your
+environment. M=1 is just a straight one-to-one move (no merge concerns).
 
 All tooling here is Go (single static binaries, nothing to download at the
 customer site) plus JSON connector configs. Every tool shares one config shape:
@@ -133,7 +141,7 @@ cp sources.sample.json sources.json    # same inventory
 # Start Connect workers (distributed mode) on the Connect host:
 #   bin/connect-distributed.sh config/connect-distributed.properties
 
-# Register the 10 source connectors (snapshot + CDC). Stagger 3-4 at a time.
+# Register all source connectors (snapshot + CDC), one per source cluster. Stagger a few at a time.
 CONNECT_URL=http://connect-host:8083 ./manage.sh register-sources
 ```
 

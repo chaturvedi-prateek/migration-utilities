@@ -1,5 +1,5 @@
 {
-  "//": "Inventory of the 10 on-prem source clusters. Copy to sources.json and edit.",
+  "//": "Inventory of the source clusters (add as many as you have). Copy to sources.json and edit.",
   "//uri": "Point reads at HIDDEN nodes so the snapshot never touches production primaries.",
   "//dbs": "'databases' drives both copy.existing.namespace.regex and the change-stream pipeline.",
   "sources": [

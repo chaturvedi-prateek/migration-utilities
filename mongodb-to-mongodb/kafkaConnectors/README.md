@@ -1,16 +1,18 @@
-# kafkaConnectors — 10 on-prem clusters → 1 Atlas cluster
+# kafkaConnectors — M source clusters → 1 Atlas cluster
 
-Kafka Connect configs for the forward migration: **10 self-managed on-prem
-replica sets → one 5-node Atlas cluster (GCP)** using the MongoDB Kafka
+Kafka Connect configs for the forward migration: **any number (M) of
+self-managed source replica sets → one Atlas cluster** using the MongoDB Kafka
 **source** and **sink** connectors, doing **full copy + CDC** in one lifecycle,
-**merging** same-name collections, at high throughput.
+**merging** same-name collections, at high throughput. One source connector per
+source cluster; the count is driven entirely by your `sources.json` — nothing
+here is hardcoded to a specific number.
 
 The **reverse/rollback** pipeline (Atlas → self-managed) is a separate
 playbook; this directory is the forward direction only.
 
 ```
-on-prem RS x10 ──(source connectors)──▶ topics cdc.<db>.<coll> ──(sink)──▶ Atlas GCP
-   read hidden nodes        same topic.prefix => same-name collections MERGE
+source RS x M ──(source connectors)──▶ topics cdc.<db>.<coll> ──(sink)──▶ Atlas
+   read hidden nodes         same topic.prefix => same-name collections MERGE
 ```
 
 ---
@@ -21,7 +23,7 @@ on-prem RS x10 ──(source connectors)──▶ topics cdc.<db>.<coll> ──(
 | --- | --- |
 | `connect-distributed.properties` | Distributed Connect **worker** config (durable Kafka-backed offsets). |
 | `source/mongo-source.template.json` | Source-connector template (`__LABEL__`, `__SOURCE_URI__`, `__NS_REGEX__`, `__PIPELINE__`). |
-| `sources.sample.json` | Inventory of the 10 clusters → copy to `sources.json` and edit. |
+| `sources.sample.json` | Inventory of the source clusters (any count) → copy to `sources.json` and edit. |
 | `generate-sources.sh` | Renders `source/generated/mongo-source-<label>.json` for each cluster. |
 | `sink/mongo-sink-cdc.json` | **Main** sink: CDC handler + namespace-merge + upsert (steady state). |
 | `sink/mongo-sink-backfill.json` | **Collision-detection** sink: insert-only → duplicate `_id` to DLQ. |
@@ -34,10 +36,10 @@ on-prem RS x10 ──(source connectors)──▶ topics cdc.<db>.<coll> ──(
 - **Distributed mode** — offsets/config/status in replicated Kafka topics so a
   worker restart resumes each change stream from its **resume token** (no
   re-snapshot, no data loss). Standalone (as in the rollback playbook) is fine
-  for one low-volume stream but not for 10 high-volume ones.
+  for one low-volume stream but not for many high-volume ones.
 - **`copy.existing=true`** — snapshot **then** tail the change stream in one
   connector: satisfies "complete data + CDC as it comes."
-- **Same `topic.prefix` (`cdc`) on all 10 sources** — same `db.coll` from every
+- **Same `topic.prefix` (`cdc`) on all sources** — same `db.coll` from every
   cluster lands on **one** topic `cdc.<db>.<coll>`, so the sink's
   `FieldPathNamespaceMapper` writes them into **one merged** target collection.
 - **Read from hidden nodes** (`readPreferenceTags=nodeType:hidden`) — the full
