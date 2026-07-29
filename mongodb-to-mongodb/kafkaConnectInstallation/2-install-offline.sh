@@ -36,6 +36,11 @@
 #                          brokers use SASL or TLS: the CLI tools need it via
 #                          --command-config, and its contents are also appended
 #                          to the worker config.
+#   --topic-prefix STR     namespace prepended VERBATIM to the internal topic
+#                          names. Required on multi-tenant clusters that enforce
+#                          a naming convention. Include any trailing separator.
+#   --topic-base STR       base name for the internal topics (default: connect),
+#                          giving <prefix><base>-offsets / -configs / -status.
 #   --create-topics        create the 3 internal topics (needs broker reachable)
 #   --no-start             install and configure only; do not start the worker
 #   --force                overwrite an existing install at --prefix
@@ -43,8 +48,17 @@
 # EXAMPLE
 #   ./2-install-offline.sh --bundle kafka-connect-offline-bundle-*.tar.gz \
 #       --bootstrap broker1:9092,broker2:9092 \
-#       --mongo-uri 'mongodb://user:pass@mongo1:27017/?replicaSet=rs0' \
-#       --create-topics
+#       --mongo-uri 'mongodb://user:pass@mongo1:27017/?replicaSet=rs0'
+#
+# EXAMPLE — multi-tenant cluster with a mandated topic namespace
+#   Target topic names:
+#     <tenant>.<env>.<colour>.kafka-connect-offsets   (and -configs, -status)
+#   ./2-install-offline.sh --bundle <bundle>.tar.gz --bootstrap broker:9093 \
+#       --client-config ./broker-security.properties \
+#       --topic-prefix '<tenant>.<env>.<colour>.' \
+#       --topic-base kafka-connect \
+#       --group-id '<tenant>.<env>.<colour>.kafka-connect-cluster' \
+#       --no-start
 #==============================================================================
 set -uo pipefail
 
@@ -56,6 +70,8 @@ GROUP_ID="connect-cluster-1"
 REPL_FACTOR="3"
 MONGO_URI=""
 CLIENT_CONFIG=""
+TOPIC_PREFIX=""          # namespace prepended verbatim to internal topic names
+TOPIC_BASE="connect"     # base name; internal topics are <prefix><base>-offsets etc.
 HEAP="2G"
 DO_TOPICS="no"
 DO_START="yes"
@@ -72,6 +88,8 @@ while [ $# -gt 0 ]; do
     --replication-factor) REPL_FACTOR="$2"; shift 2 ;;
     --mongo-uri)          MONGO_URI="$2"; shift 2 ;;
     --client-config)      CLIENT_CONFIG="$2"; shift 2 ;;
+    --topic-prefix)       TOPIC_PREFIX="$2"; shift 2 ;;
+    --topic-base)         TOPIC_BASE="$2"; shift 2 ;;
     --heap)               HEAP="$2"; shift 2 ;;
     --create-topics)      DO_TOPICS="yes"; shift ;;
     --no-start)           DO_START="no"; shift ;;
@@ -97,6 +115,20 @@ fi
 
 #------------------------------------------------------------ prerequisites ---
 step "Checking the target server"
+
+# The bundle holds LINUX binaries (JDK, mongosh). Architecture alone is not
+# enough to tell them apart: aarch64 macOS and aarch64 Linux both report
+# arm64/aarch64, but the binaries are not interchangeable. Check the OS first,
+# before spending time unpacking a ~450 MB bundle that cannot run here.
+HOST_OS="$(uname -s)"
+if [ "$HOST_OS" != "Linux" ]; then
+  err "this installer must run on the Linux target server, not on $HOST_OS"
+  echo
+  echo "  The bundle contains Linux binaries (JDK, mongosh) which cannot execute here."
+  echo "  Copy the bundle and both scripts to the target server and run this there."
+  exit 1
+fi
+ok "running on Linux ($(uname -m))"
 
 command -v tar >/dev/null 2>&1 || die "tar is required and was not found."
 ok "tar present"
@@ -171,9 +203,18 @@ case "${BUNDLE_ARCH:-x86_64}:$HOST_ARCH" in
       ok "bundle architecture ${BUNDLE_ARCH:-x86_64} matches this server ($HOST_ARCH)" ;;
   *)
       err "architecture mismatch: bundle is for ${BUNDLE_ARCH:-x86_64}, this server is $HOST_ARCH"
-      echo "  Re-run step 1 on the internet machine with: --arch $HOST_ARCH"
+      echo
+      echo "  --arch describes the TARGET SERVER, not the machine that runs step 1."
+      echo "  Determine it with 'uname -m' ON THIS SERVER (= $HOST_ARCH), then rebuild"
+      echo "  the bundle on the internet machine with:"
+      echo "      ./1-download-bundle.sh --arch $HOST_ARCH"
       exit 1 ;;
 esac
+
+# The bundle also records the OS it was built for; refuse a mismatch outright.
+if [ -n "${BUNDLE_OS:-}" ] && [ "$BUNDLE_OS" != "$HOST_OS" ]; then
+  die "bundle targets $BUNDLE_OS but this server is $HOST_OS"
+fi
 
 # Re-verify every artifact against the checksums recorded at download time.
 if [ -f "$SRC_DIR/meta/MANIFEST.txt" ] && [ "$(_sha256 /dev/null)" != skip ]; then
@@ -298,6 +339,74 @@ else
 fi
 umask 022
 
+#------------------------------------------------------- internal topic names --
+# Connect's internal topics are named by configuration, not convention, so a
+# cluster that mandates a tenant namespace simply needs the right names here.
+# The prefix is concatenated VERBATIM — include any trailing separator ('.' or
+# '-') yourself, because conventions differ.
+OFFSETS_TOPIC="${TOPIC_PREFIX}${TOPIC_BASE}-offsets"
+CONFIGS_TOPIC="${TOPIC_PREFIX}${TOPIC_BASE}-configs"
+STATUS_TOPIC="${TOPIC_PREFIX}${TOPIC_BASE}-status"
+
+step "Internal topic names"
+echo "    $OFFSETS_TOPIC   (partitions 25)"
+echo "    $CONFIGS_TOPIC   (partitions 1)"
+echo "    $STATUS_TOPIC    (partitions 5)"
+if [ -n "$TOPIC_PREFIX" ]; then
+  ok "using topic namespace '$TOPIC_PREFIX'"
+  case "$TOPIC_PREFIX" in
+    *.|*-|*_) : ;;
+    *) warn "the prefix does not end with a separator ('.', '-' or '_') — check the names above carefully" ;;
+  esac
+  # The consumer group is a separate ACL resource and is NOT derived from the
+  # topic names; on a namespaced cluster it usually needs the same prefix.
+  case "$GROUP_ID" in
+    "$TOPIC_PREFIX"*) ok "group.id carries the same namespace" ;;
+    *) warn "group.id '$GROUP_ID' does not carry the '$TOPIC_PREFIX' namespace"
+       warn "if the cluster enforces prefixed group names, pass --group-id accordingly" ;;
+  esac
+else
+  ok "no topic namespace: using the default $OFFSETS_TOPIC / $CONFIGS_TOPIC / $STATUS_TOPIC"
+fi
+
+#-------------------------------------------------------- broker client config --
+# The Kafka CLI tools (kafka-topics.sh and friends) do NOT read the worker
+# properties. On a SASL/TLS or mTLS cluster they need the same settings passed
+# via --command-config, or every call fails with an opaque timeout.
+CMD_CONFIG_ARG=""
+if [ -n "$CLIENT_CONFIG" ]; then
+  [ -f "$CLIENT_CONFIG" ] || die "--client-config file not found: $CLIENT_CONFIG"
+  cp "$CLIENT_CONFIG" "$PREFIX/etc/client.properties" || die "cannot copy $CLIENT_CONFIG"
+  chmod 600 "$PREFIX/etc/client.properties"
+  CMD_CONFIG_ARG="--command-config $PREFIX/etc/client.properties"
+  ok "broker security settings installed to etc/client.properties (0600)"
+
+  # Keystores are referenced by ABSOLUTE PATH from inside the properties file.
+  # The most common mTLS failure is a path that does not exist, or a file the
+  # (non-root) install user cannot read. Check now, not at first connection.
+  MISSING=0
+  for k in ssl.keystore.location ssl.truststore.location; do
+    v="$(grep -E "^[[:space:]]*${k}[[:space:]]*=" "$PREFIX/etc/client.properties" \
+         | tail -1 | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -n "$v" ]; then
+      if [ ! -f "$v" ]; then
+        err "$k points to a file that does not exist: $v"; MISSING=1
+      elif [ ! -r "$v" ]; then
+        err "$k is not readable by $(id -un): $v"; MISSING=1
+      else
+        ok "$k readable: $v"
+      fi
+    fi
+  done
+  [ "$MISSING" -eq 0 ] || die "fix the keystore/truststore paths or permissions, then re-run"
+
+  grep -qE '^[[:space:]]*security.protocol[[:space:]]*=' "$PREFIX/etc/client.properties" \
+    || warn "no security.protocol in the client config — SSL or SASL_SSL is usually required"
+else
+  warn "no --client-config given: assuming PLAINTEXT brokers with no authentication"
+  warn "if your brokers use TLS/mTLS or SASL, re-run with --client-config <file>"
+fi
+
 #-------------------------------------------------------------- worker config --
 step "Writing Connect worker configuration"
 
@@ -324,13 +433,13 @@ key.converter.schemas.enable=false
 value.converter.schemas.enable=false
 
 # Internal topics. All three MUST be cleanup.policy=compact.
-offset.storage.topic=connect-offsets
+offset.storage.topic=${OFFSETS_TOPIC}
 offset.storage.replication.factor=${REPL_FACTOR}
 offset.storage.partitions=25
-config.storage.topic=connect-configs
+config.storage.topic=${CONFIGS_TOPIC}
 config.storage.replication.factor=${REPL_FACTOR}
 config.storage.partitions=1
-status.storage.topic=connect-status
+status.storage.topic=${STATUS_TOPIC}
 status.storage.replication.factor=${REPL_FACTOR}
 status.storage.partitions=5
 offset.flush.interval.ms=10000
@@ -476,11 +585,11 @@ mk() {
     --create --if-not-exists --topic "\$1" --partitions "\$2" \\
     --replication-factor ${REPL_FACTOR} --config cleanup.policy=compact
 }
-mk connect-offsets 25
-mk connect-configs 1
-mk connect-status  5
+mk "${OFFSETS_TOPIC}" 25
+mk "${CONFIGS_TOPIC}" 1
+mk "${STATUS_TOPIC}"  5
 echo
-"\$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} --list | grep '^connect-'
+"\$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} --list | grep -F -e "${OFFSETS_TOPIC}" -e "${CONFIGS_TOPIC}" -e "${STATUS_TOPIC}"
 EOF
 
 cat > "$PREFIX/bin/verify.sh" <<EOF
@@ -529,8 +638,56 @@ RESULT: FAIL — see above."
 exit \$RC
 EOF
 
+cat > "$PREFIX/bin/check-internal-topics.sh" <<EOF
+#!/usr/bin/env bash
+# READ-ONLY. Verifies that the three Connect internal topics exist and are
+# configured correctly. Use this when your principal is NOT permitted to create
+# topics and a platform team pre-creates them for you: run it BEFORE start.sh.
+# All three MUST be cleanup.policy=compact — a delete policy on connect-configs
+# silently loses connector configuration.
+set -uo pipefail
+. "$PREFIX/bin/env.sh"
+RC=0
+for t in "${OFFSETS_TOPIC}" "${CONFIGS_TOPIC}" "${STATUS_TOPIC}"; do
+  D="\$("\$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} \\
+        --describe --topic "\$t" 2>&1)"
+  case "\$D" in
+    *"does not exist"*|*UnknownTopic*)
+      echo "  MISSING  \$t — ask the platform team to create it"; RC=1; continue ;;
+    *Authorization*|*not authorized*)
+      echo "  DENIED   \$t — no Describe permission for this principal"; RC=1; continue ;;
+  esac
+  P="\$(printf '%s' "\$D" | grep -oE 'PartitionCount: [0-9]+' | head -1 | awk '{print \$2}')"
+  C="\$("\$KAFKA_HOME/bin/kafka-configs.sh" --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} \\
+        --entity-type topics --entity-name "\$t" --describe 2>/dev/null \\
+        | grep -oE 'cleanup.policy=[a-z,]+' | head -1)"
+  R="\$("\$KAFKA_HOME/bin/kafka-configs.sh" --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} \\
+        --entity-type topics --entity-name "\$t" --describe 2>/dev/null \\
+        | grep -oE 'retention.ms=[0-9-]+' | head -1)"
+  case "\$C" in
+    "cleanup.policy=compact")
+      echo "  OK       \$t (partitions=\$P, compact)" ;;
+    "cleanup.policy=compact,delete"|"cleanup.policy=delete,compact")
+      echo "  RISK     \$t (partitions=\$P, compact+delete, \${R:-retention.ms=broker default})"
+      echo "           compaction is on, but time-based deletion is ALSO on. Segments older"
+      echo "           than retention.ms are removed even when they hold the newest value"
+      echo "           for a key, which can lose connector configs and source offsets."
+      echo "           Request cleanup.policy=compact only for this topic." ;;
+    "cleanup.policy=delete")
+      echo "  WRONG    \$t (partitions=\$P, delete) — MUST include compact."
+      echo "           With a delete-only policy, Connect WILL lose configuration/offsets."; RC=1 ;;
+    *)
+      echo "  WRONG    \$t (partitions=\$P, \${C:-cleanup.policy=unknown}) — MUST be compact"; RC=1 ;;
+  esac
+done
+echo
+if [ \$RC -eq 0 ]; then echo "RESULT: PASS — internal topics are present and compacted."
+else echo "RESULT: FAIL — see above. Do not start the worker until these are correct."; fi
+exit \$RC
+EOF
+
 chmod +x "$PREFIX"/bin/*.sh
-ok "bin/start.sh bin/stop.sh bin/status.sh bin/verify.sh bin/create-internal-topics.sh bin/env.sh"
+ok "bin/: env.sh start.sh stop.sh status.sh verify.sh create-internal-topics.sh check-internal-topics.sh"
 
 #--------------------------------------------------------- example connectors --
 cat > "$PREFIX/examples/source-connector.json" <<EOF
@@ -596,6 +753,14 @@ Notes
 -----
 * The source connector requires a MongoDB replica set or sharded cluster.
   Change streams do not work against a standalone mongod.
+* DELETES DO NOT REPLICATE with publish.full.document.only=true (as set in the
+  source example). Inserts and updates do. Verified on a live setup: the source
+  emits nothing usable for a delete event, so the sink leaves the document in
+  place. This is expected behaviour, not data loss. If deletes must replicate,
+  remove publish.full.document.only, emit the full change-stream document, and
+  use a delete-aware sink writemodel.strategy such as DeleteOneBusinessKeyStrategy.
+  Decide this before go-live; it is easy to mistake for silent data divergence
+  months later.
 * MongoDB privileges: source needs 'read' on the watched database (which grants
   find + changeStream); sink needs 'readWrite' on the target database.
 * If your brokers have auto topic creation disabled, pre-create the source
@@ -604,13 +769,128 @@ Notes
 * Credentials stay in etc/secrets.properties (mode 0600) and are referenced with
   \${file:...}, so they are not retrievable through the REST API.
 EOF
+# Template for --client-config on a cluster that uses keystore/truststore (mTLS).
+cat > "$PREFIX/examples/broker-security-mtls.properties.example" <<'EOF'
+# Broker security settings for a keystore/truststore (mTLS) cluster.
+# Copy this, fill in the real values, then pass it as:
+#     ./2-install-offline.sh --client-config <this-file> ...
+#
+# Paths MUST be absolute and readable by the user running Kafka Connect.
+# The installer verifies both before writing any configuration.
+
+security.protocol=SSL
+
+ssl.truststore.location=/absolute/path/to/kafka.client.truststore.jks
+ssl.truststore.password=CHANGEME
+ssl.truststore.type=JKS
+
+ssl.keystore.location=/absolute/path/to/kafka.client.keystore.jks
+ssl.keystore.password=CHANGEME
+ssl.key.password=CHANGEME
+ssl.keystore.type=JKS
+
+# Leave empty ONLY if your brokers' certificates do not match their hostnames
+# and your security team has accepted that. Empty disables hostname verification.
+#ssl.endpoint.identification.algorithm=https
+
+# If the cluster combines TLS with SASL, use SASL_SSL instead and add:
+#security.protocol=SASL_SSL
+#sasl.mechanism=SCRAM-SHA-512
+#sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="connect" password="CHANGEME";
+EOF
+chmod 600 "$PREFIX/examples/broker-security-mtls.properties.example"
+
+cat > "$PREFIX/examples/REQUIRED-TOPICS-AND-ACLS.txt" <<EOF
+Hand this to the team that administers the Kafka cluster.
+================================================================================
+
+Kafka Connect cannot run without three internal topics. If this principal is not
+permitted to create topics, they must be pre-created EXACTLY as below.
+
+TOPICS TO CREATE
+----------------
+  name              partitions   replication      REQUIRED config
+  ${OFFSETS_TOPIC}
+      partitions 25   replication ${REPL_FACTOR}   cleanup.policy=compact
+  ${CONFIGS_TOPIC}
+      partitions 1    replication ${REPL_FACTOR}   cleanup.policy=compact
+  ${STATUS_TOPIC}
+      partitions 5    replication ${REPL_FACTOR}   cleanup.policy=compact
+
+All three MUST be cleanup.policy=compact. A delete policy on connect-configs
+silently loses connector configuration.
+
+RETENTION — PLEASE READ
+-----------------------
+These three topics are COMPACTED, not retention-based. They are keyed state, not
+an event stream, and they are small. They should NOT have a time-based retention
+policy applied:
+
+  cleanup.policy=compact          <-- required
+  retention.ms                    <-- do not set; leave unset for these 3 topics
+
+If a blanket retention standard must be applied to every topic, the least-bad
+form is cleanup.policy=compact,delete with retention.ms set as long as possible.
+Understand the risk: with compact,delete, segments older than retention.ms are
+deleted even when they contain the CURRENT value for a key. That can silently
+drop connector configurations and source offsets, causing connectors to vanish or
+to restart from the beginning after a restart. An exemption for these three
+topics is strongly preferred.
+
+Retention DOES apply normally to the data topics used by connectors (source
+target topics and the dead letter queue). Those should follow the standard:
+
+  1 day    retention.ms=86400000
+  3 days   retention.ms=259200000
+  7 days   retention.ms=604800000
+  14 days  retention.ms=1209600000
+  30 days  retention.ms=2592000000
+
+  formula: days x 86400000
+
+Adjust the replication factor to the cluster standard; it must not exceed the
+broker count. If it differs from ${REPL_FACTOR}, re-run the installer with
+--replication-factor N so the worker configuration matches.
+
+ACLs REQUIRED BY THE CONNECT PRINCIPAL
+--------------------------------------
+With mTLS the principal is the certificate DN, for example:
+  User:CN=connect.example.com,OU=Platform,O=Example,C=GB
+
+  resource                                     operations
+  Topic  ${OFFSETS_TOPIC}      Read, Write, Describe
+  Topic  ${CONFIGS_TOPIC}      Read, Write, Describe
+  Topic  ${STATUS_TOPIC}       Read, Write, Describe
+  Group  ${GROUP_ID}                           Read
+  Cluster                                      Describe
+
+PER-CONNECTOR, added as connectors are deployed
+-----------------------------------------------
+  Source connector target topics  Write, Describe   (topic.prefix.database.collection)
+  Sink connector source topics    Read,  Describe
+  Sink consumer group             Read              (connect-<connector-name>)
+  Dead letter queue topic         Write, Describe   (for example dlq.mongo-sink-1)
+
+If auto topic creation is disabled (normal in locked-down clusters), the source
+target topics and the DLQ topic must ALSO be pre-created — with your normal
+retention policy, not compact.
+
+VERIFYING (read-only, safe to run any time)
+-------------------------------------------
+  $PREFIX/bin/check-internal-topics.sh
+EOF
+ok "examples/broker-security-mtls.properties.example"
+ok "examples/REQUIRED-TOPICS-AND-ACLS.txt (hand this to the Kafka admin team)"
 ok "examples/source-connector.json examples/sink-connector.json examples/README.txt"
 
 #----------------------------------------------------------------- topics ------
 if [ "$DO_TOPICS" = yes ]; then
   step "Creating Connect internal topics"
+  warn "this requires Create permission on the cluster. If your principal is not"
+  warn "permitted to create topics, omit --create-topics, have them pre-created, and"
+  warn "verify with: $PREFIX/bin/check-internal-topics.sh"
   if "$PREFIX/bin/create-internal-topics.sh" >"$PREFIX/logs/create-topics.log" 2>&1; then
-    ok "connect-offsets, connect-configs, connect-status created (or already existed)"
+    ok "internal topics created (or already existed)"
   else
     warn "topic creation failed — see $PREFIX/logs/create-topics.log"
     warn "check the broker address, network path, and any SASL/TLS settings in etc/connect-distributed.properties"
@@ -662,7 +942,8 @@ ${C_G}==========================================================================
    kafka/      Apache Kafka $KAFKA_VERSION (provides Kafka Connect)
    plugins/    MongoDB Kafka Connector $CONNECTOR_VERSION (source + sink)
    etc/        worker config, log4j config, secrets.properties (0600)
-   bin/        start.sh stop.sh status.sh verify.sh create-internal-topics.sh
+   bin/        start.sh stop.sh status.sh verify.sh
+               create-internal-topics.sh check-internal-topics.sh
    logs/       worker logs
    examples/   connector config templates
 
@@ -676,6 +957,9 @@ ${C_G}==========================================================================
 
  Next steps:
 
+   0. If this principal cannot create topics, give the Kafka admin team
+      examples/REQUIRED-TOPICS-AND-ACLS.txt, then confirm with:
+        $PREFIX/bin/check-internal-topics.sh
    1. Put your MongoDB connection string in etc/secrets.properties (0600).
    2. Deploy connectors using the templates in examples/ — see examples/README.txt.
    3. To survive a reboot without root, either add bin/start.sh to your crontab
