@@ -106,9 +106,20 @@ else die "No sha256 tool available (need sha256sum, shasum, or python3)."
 fi
 ok "sha256 tool available"
 
+# Progress is shown deliberately: the bundle is ~450 MB, and a silent multi-minute
+# download on a slow link is indistinguishable from a hung script.
 fetch() { # fetch <url> <dest>
-  if [ "$DL" = curl ]; then curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1"
-  else wget -q -T 20 -t 3 -O "$2" "$1"; fi
+  echo "    fetching $(basename "$2")"
+  if [ "$DL" = curl ]; then
+    curl -fL --retry 3 --connect-timeout 15 --max-time 3600 --progress-bar -o "$2" "$1"
+  else
+    wget -q --show-progress -T 15 -t 3 -O "$2" "$1"
+  fi
+}
+# For small files where a progress bar is just noise.
+fetch_quiet() { # fetch_quiet <url> <dest>
+  if [ "$DL" = curl ]; then curl -fsSL --retry 3 --connect-timeout 15 -o "$2" "$1"
+  else wget -q -T 15 -t 3 -O "$2" "$1"; fi
 }
 fetch_stdout() {
   if [ "$DL" = curl ]; then curl -fsSL --retry 3 --connect-timeout 20 "$1"
@@ -192,13 +203,13 @@ case "$KBASE" in
   *archive*) warn "Kafka $KAFKA_VERSION not on the CDN; using archive.apache.org — expect a slow download" ;;
 esac
 fetch "${KBASE}/${KFILE}"        "$WORK/kafka/${KFILE}"        || die "download failed: ${KFILE}"
-fetch "${KBASE}/${KFILE}.sha512" "$WORK/kafka/${KFILE}.sha512" || die "download failed: ${KFILE}.sha512"
+fetch_quiet "${KBASE}/${KFILE}.sha512" "$WORK/kafka/${KFILE}.sha512" || die "download failed: ${KFILE}.sha512"
 ok "Kafka ${KAFKA_VERSION}  ($(du -h "$WORK/kafka/${KFILE}" | cut -f1))"
 
 # GPG material. The .asc is worthless without the KEYS file, which the offline
 # server cannot fetch from a keyserver — so stage both.
-fetch "${KBASE}/${KFILE}.asc" "$WORK/kafka/${KFILE}.asc" 2>/dev/null \
-  && fetch "https://downloads.apache.org/kafka/KEYS" "$WORK/kafka/KEYS" 2>/dev/null \
+fetch_quiet "${KBASE}/${KFILE}.asc" "$WORK/kafka/${KFILE}.asc" 2>/dev/null \
+  && fetch_quiet "https://downloads.apache.org/kafka/KEYS" "$WORK/kafka/KEYS" 2>/dev/null \
   && ok "Kafka signature + Apache KEYS (for optional offline gpg --verify)" \
   || warn "signature material unavailable; checksum verification only"
 
@@ -208,7 +219,7 @@ fetch "${KBASE}/${KFILE}.asc" "$WORK/kafka/${KFILE}.asc" 2>/dev/null \
 CJAR="mongo-kafka-connect-${CONNECTOR_VERSION}-all.jar"
 CBASE="https://repo1.maven.org/maven2/org/mongodb/kafka/mongo-kafka-connect/${CONNECTOR_VERSION}"
 fetch "${CBASE}/${CJAR}" "$WORK/connector/${CJAR}" || die "download failed: ${CJAR}"
-fetch "${CBASE}/${CJAR}.sha1" "$WORK/connector/${CJAR}.sha1" 2>/dev/null
+fetch_quiet "${CBASE}/${CJAR}.sha1" "$WORK/connector/${CJAR}.sha1" 2>/dev/null
 ok "MongoDB connector ${CONNECTOR_VERSION}  ($(du -h "$WORK/connector/${CJAR}" | cut -f1))"
 
 JDK_TGZ="temurin-${JDK_MAJOR}-linux-${JDK_ARCH}.tar.gz"
@@ -319,6 +330,7 @@ LOG4J_FLAVOUR=${LOG4J_FLAVOUR}
 BUNDLED_AT=$(date -u +%FT%TZ)
 BUNDLED_ON=$(uname -s)-$(uname -m)
 BUNDLE_ARCH=${TARGET_ARCH}
+BUNDLE_OS=Linux
 EOF
 
 {
