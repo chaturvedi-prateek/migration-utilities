@@ -513,15 +513,16 @@ mkdir -p "$PREFIX/logs" "$PREFIX/run"
 # load (many broker connections + producer/consumer clients). systemd's
 # LimitNOFILE is not available to us without root, but a non-root process may
 # raise its OWN soft limit up to the hard limit. Do that here.
-HARD_NOFILE="$(ulimit -Hn 2>/dev/null || echo 0)"
-case "$HARD_NOFILE" in
+HARD_NOFILE="\$(ulimit -Hn 2>/dev/null || echo 0)"
+case "\$HARD_NOFILE" in
   unlimited) ulimit -n 100000 2>/dev/null ;;
   ''|0) : ;;
-  *) if [ "$HARD_NOFILE" -gt 1024 ]; then
-       [ "$HARD_NOFILE" -gt 100000 ] && ulimit -n 100000 2>/dev/null || ulimit -n "$HARD_NOFILE" 2>/dev/null
+  *) if [ "\$HARD_NOFILE" -gt 1024 ]; then
+       if [ "\$HARD_NOFILE" -gt 100000 ]; then ulimit -n 100000 2>/dev/null
+       else ulimit -n "\$HARD_NOFILE" 2>/dev/null; fi
      fi ;;
 esac
-echo "open file limit: $(ulimit -n)"
+echo "open file limit: \$(ulimit -n)"
 nohup "\$KAFKA_HOME/bin/connect-distributed.sh" \\
       "$PREFIX/etc/connect-distributed.properties" \\
       > "$PREFIX/logs/connect-stdout.log" 2>&1 &
@@ -686,8 +687,63 @@ else echo "RESULT: FAIL — see above. Do not start the worker until these are c
 exit \$RC
 EOF
 
+cat > "$PREFIX/bin/check-brokers.sh" <<EOF
+#!/usr/bin/env bash
+# READ-ONLY. --bootstrap is only a DISCOVERY list: Connect learns the full broker
+# set from cluster metadata and then talks directly to every broker, because
+# partition leaders can be on any of them. If the firewall only permits the
+# bootstrap subset, Connect fails intermittently with timeouts and
+# NOT_LEADER_OR_FOLLOWER whenever a leader sits on an unreachable broker.
+# This script lists every broker the cluster advertises and probes each one.
+set -uo pipefail
+. "$PREFIX/bin/env.sh"
+
+echo "bootstrap list: \$BOOTSTRAP_SERVERS"
+echo
+echo "== brokers advertised by the cluster =="
+OUT="\$("\$KAFKA_HOME/bin/kafka-broker-api-versions.sh" \\
+        --bootstrap-server "\$BOOTSTRAP_SERVERS" ${CMD_CONFIG_ARG} 2>&1)"
+if [ -z "\$OUT" ] || printf '%s' "\$OUT" | grep -qiE 'error|exception|timed out'; then
+  echo "  FAILED to query the cluster:"
+  printf '%s\n' "\$OUT" | head -8
+  echo
+  echo "  Check the bootstrap address, the TLS port, and --client-config settings."
+  exit 1
+fi
+
+BROKERS="\$(printf '%s' "\$OUT" | grep -oE '^[A-Za-z0-9._-]+:[0-9]+' | sort -u)"
+COUNT="\$(printf '%s\n' "\$BROKERS" | grep -c . )"
+echo "  discovered \$COUNT broker(s)"
+echo
+
+echo "== reachability of every discovered broker =="
+RC=0
+for b in \$BROKERS; do
+  h="\${b%:*}"; pt="\${b##*:}"
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 5 "\$h" "\$pt" >/dev/null 2>&1; then echo "  OK       \$b"
+    else echo "  BLOCKED  \$b — TCP connect failed"; RC=1; fi
+  elif timeout 5 bash -c "cat < /dev/null > /dev/tcp/\$h/\$pt" 2>/dev/null; then
+    echo "  OK       \$b"
+  else
+    echo "  BLOCKED  \$b — TCP connect failed"; RC=1
+  fi
+done
+echo
+if [ \$RC -eq 0 ]; then
+  echo "RESULT: PASS — all \$COUNT advertised brokers are reachable."
+else
+  echo "RESULT: FAIL — some brokers are unreachable."
+  echo "Connect will appear to work, then fail whenever a partition leader is on a"
+  echo "blocked broker. Ask for network access to EVERY broker on the TLS port,"
+  echo "not only the bootstrap subset."
+fi
+exit \$RC
+EOF
+
 chmod +x "$PREFIX"/bin/*.sh
-ok "bin/: env.sh start.sh stop.sh status.sh verify.sh create-internal-topics.sh check-internal-topics.sh"
+ok "bin/: env.sh start.sh stop.sh status.sh verify.sh"
+ok "bin/: create-internal-topics.sh check-internal-topics.sh check-brokers.sh"
 
 #--------------------------------------------------------- example connectors --
 cat > "$PREFIX/examples/source-connector.json" <<EOF
@@ -959,7 +1015,8 @@ ${C_G}==========================================================================
 
    0. If this principal cannot create topics, give the Kafka admin team
       examples/REQUIRED-TOPICS-AND-ACLS.txt, then confirm with:
-        $PREFIX/bin/check-internal-topics.sh
+        $PREFIX/bin/check-brokers.sh          # every broker reachable, not just bootstrap
+        $PREFIX/bin/check-internal-topics.sh  # topics exist and are compacted
    1. Put your MongoDB connection string in etc/secrets.properties (0600).
    2. Deploy connectors using the templates in examples/ — see examples/README.txt.
    3. To survive a reboot without root, either add bin/start.sh to your crontab
