@@ -348,10 +348,21 @@ func cleanMetadata(ctx context.Context, cfg *Config, hub string) error {
 }
 
 // verifyJob compares per-database document counts between a job's source and
-// destination for each included namespace.
+// destination. When the job has no includeNamespaces (whole-cluster sync), it
+// verifies every non-system user database found on the source.
 func verifyJob(ctx context.Context, cfg *Config, j Job) error {
+	dbs := make([]string, 0, len(j.IncludeNamespaces))
 	for _, ns := range j.IncludeNamespaces {
-		db := ns.Database
+		dbs = append(dbs, ns.Database)
+	}
+	if len(dbs) == 0 {
+		listed, err := listUserDatabases(ctx, cfg, j.Source)
+		if err != nil {
+			return fmt.Errorf("list source databases: %w", err)
+		}
+		dbs = listed
+	}
+	for _, db := range dbs {
 		js := fmt.Sprintf(`var t=0;db.getSiblingDB(%q).getCollectionNames().forEach(function(c){t+=db.getSiblingDB(%q)[c].countDocuments({});});print(t);`, db, db)
 		src, err := mongoshEval(ctx, cfg, j.Source, js)
 		if err != nil {
