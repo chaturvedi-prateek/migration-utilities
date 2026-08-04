@@ -347,6 +347,27 @@ func cleanMetadata(ctx context.Context, cfg *Config, hub string) error {
 	return nil
 }
 
+// listUserDatabases returns the non-system user databases on a cluster (excludes
+// admin/local/config and the mongosync reserved DBs), used to verify a whole-cluster
+// job that has no includeNamespaces filter.
+func listUserDatabases(ctx context.Context, cfg *Config, uri string) ([]string, error) {
+	js := `print(db.adminCommand({listDatabases:1,nameOnly:true}).databases` +
+		`.map(function(d){return d.name;})` +
+		`.filter(function(n){return ["admin","local","config","mongosync_reserved_for_internal_use","__mdb_internal_mongosync"].indexOf(n)<0;})` +
+		`.join("\n"));`
+	out, err := mongoshEval(ctx, cfg, uri, js)
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, out)
+	}
+	var dbs []string
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			dbs = append(dbs, s)
+		}
+	}
+	return dbs, nil
+}
+
 // verifyJob compares per-database document counts between a job's source and
 // destination. When the job has no includeNamespaces (whole-cluster sync), it
 // verifies every non-system user database found on the source.

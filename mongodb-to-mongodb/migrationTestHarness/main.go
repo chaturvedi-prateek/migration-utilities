@@ -31,6 +31,7 @@ func main() {
 	keep := flag.Bool("keep", false, "do not tear down clusters after the test")
 	teardownOnly := flag.Bool("teardown-only", false, "just stop clusters from a prior run and exit")
 	emitConfig := flag.String("emit-config", "", "write the orchestrator.json the harness would use to this path and exit (no provisioning)")
+	driver := flag.String("driver", "orchestrator", "migration driver: orchestrator | scaffold")
 	flag.Parse()
 
 	if *emitConfig != "" {
@@ -58,7 +59,7 @@ func main() {
 
 	t, err := resolveTools(toolDir, *skipDownload)
 	must(err)
-	logf("tools: mongod=%s mongosh=%s mongosync=%s orchestrator=%s", t.mongod, t.mongosh, t.mongosync, t.orchestrator)
+	logf("tools: mongod=%s mongosh=%s mongosync=%s", t.mongod, t.mongosh, t.mongosync)
 
 	if *teardownOnly {
 		logf("teardown-only: stopping any clusters from a prior run")
@@ -95,35 +96,25 @@ func main() {
 
 	confPath := filepath.Join(base, "orchestrator.json")
 	must(writeOrchestratorConfig(confPath, t, cs, logDir))
-	logf("wrote orchestrator config: %s", confPath)
+	logf("wrote migration config: %s", confPath)
 
-	// ---- Phase 1: parallel 1:1 sync to steady state (leaves mongosync running) ----
-	logf("=== PHASE 1: sync (run to steady state) ===")
-	if err := orchestrate(t, logDir, "phase1-sync", "sync", "--config", confPath, "--poll", "10", "--lag", "10"); err != nil {
-		fatal("phase1 sync: %v", err)
+	// ---- Drive the migration via the selected driver ----
+	var p1, p2 []verifyResult
+	switch *driver {
+	case "orchestrator":
+		orch, err := locateOrchestrator(toolDir)
+		if err != nil {
+			fatal("%v", err)
+		}
+		t.orchestrator = orch
+		p1, p2 = runViaOrchestrator(t, cs, srcCounts, logDir, confPath)
+	case "scaffold":
+		sc, err := resolveScaffoldTools(toolDir, *skipDownload)
+		must(err)
+		p1, p2 = runViaScaffold(t, sc, cs, srcCounts, base, logDir, confPath)
+	default:
+		fatal("unknown --driver %q (want orchestrator | scaffold)", *driver)
 	}
-
-	// ---- Coordinated commit (single cutover for all clusters) ----
-	logf("=== PHASE 1 CUTOVER: commit all syncs together ===")
-	if err := orchestrate(t, logDir, "phase1-commit", "commit", "--config", confPath, "--lag", "10"); err != nil {
-		fatal("phase1 commit: %v", err)
-	}
-	p1 := verifyPhase1(t, cs, srcCounts)
-	reportChecks("Phase 1", p1)
-
-	// ---- Stop Phase-1 syncs (waits for COMMITTED) to free ports for consolidation ----
-	logf("=== PHASE 1 STOP: wait for COMMITTED, then stop syncs ===")
-	if err := orchestrate(t, logDir, "phase1-stop", "stop", "--config", confPath); err != nil {
-		fatal("phase1 stop: %v", err)
-	}
-
-	// ---- Phase 2: sequential consolidation into the hub ----
-	logf("=== PHASE 2: consolidate (10 → 1) ===")
-	if err := orchestrate(t, logDir, "phase2-consolidate", "consolidate", "--config", confPath, "--verify", "--poll", "10", "--lag", "10"); err != nil {
-		fatal("phase2 consolidate: %v", err)
-	}
-	p2 := verifyHub(t, cs, srcCounts)
-	reportChecks("Phase 2 (hub)", p2)
 
 	// ---- Summary + log bundle ----
 	all := append(append([]verifyResult{}, p1...), p2...)
@@ -136,7 +127,11 @@ func main() {
 	logf("=== RESULT: %d/%d checks passed in %s ===", pass, len(all), time.Since(start).Round(time.Second))
 
 	bundle := filepath.Join(base, "migtest-logs.tgz")
-	if err := run(base, "tar", "-czf", bundle, "-C", base, "logs", "orchestrator.json"); err != nil {
+	items := []string{"logs", "orchestrator.json"}
+	if _, err := os.Stat(filepath.Join(base, "scaffold")); err == nil {
+		items = append(items, "scaffold") // generated artifacts + their per-step logs
+	}
+	if err := run(base, "tar", append([]string{"-czf", bundle, "-C", base}, items...)...); err != nil {
 		logf("WARN: could not bundle logs: %v", err)
 	} else {
 		logf("log bundle ready to share: %s", bundle)
@@ -144,6 +139,34 @@ func main() {
 	if pass != len(all) {
 		os.Exit(1)
 	}
+}
+
+// runViaOrchestrator drives the migration with the automated mongosyncOrchestrator
+// (the original path): sync -> commit -> stop -> consolidate.
+func runViaOrchestrator(t *tools, cs *clusterSet, srcCounts []int64, logDir, confPath string) (p1, p2 []verifyResult) {
+	logf("=== PHASE 1: sync (run to steady state) ===")
+	if err := orchestrate(t, logDir, "phase1-sync", "sync", "--config", confPath, "--poll", "10", "--lag", "10"); err != nil {
+		fatal("phase1 sync: %v", err)
+	}
+	logf("=== PHASE 1 CUTOVER: commit all syncs together ===")
+	if err := orchestrate(t, logDir, "phase1-commit", "commit", "--config", confPath, "--lag", "10"); err != nil {
+		fatal("phase1 commit: %v", err)
+	}
+	p1 = verifyPhase1(t, cs, srcCounts)
+	reportChecks("Phase 1", p1)
+
+	logf("=== PHASE 1 STOP: wait for COMMITTED, then stop syncs ===")
+	if err := orchestrate(t, logDir, "phase1-stop", "stop", "--config", confPath); err != nil {
+		fatal("phase1 stop: %v", err)
+	}
+
+	logf("=== PHASE 2: consolidate (10 → 1) ===")
+	if err := orchestrate(t, logDir, "phase2-consolidate", "consolidate", "--config", confPath, "--verify", "--poll", "10", "--lag", "10"); err != nil {
+		fatal("phase2 consolidate: %v", err)
+	}
+	p2 = verifyHub(t, cs, srcCounts)
+	reportChecks("Phase 2 (hub)", p2)
+	return p1, p2
 }
 
 // orchestrate runs the mongosyncOrchestrator binary with the given args, teeing its
