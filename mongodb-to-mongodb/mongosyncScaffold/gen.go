@@ -203,6 +203,9 @@ func runbookMd(step *Step) string {
 			"./verify.sh           <id>     # count-compare source vs destination\n"+
 			"#   then repoint this cluster's application to the hub\n"+
 			"```\n\n"+
+			"After the **last** instance, drop mongosync metadata left on the hub by the "+
+			"final merge (run with no argument = all instances, which cleans the hub):\n\n"+
+			"```shell\n./cleanup-metadata.sh\n```\n\n"+
 			"Artifacts to review before running: `configs/<id>.mongosync.json`, "+
 			"`start-bodies/<id>.start.json`.\n", step.Name, rows.String())
 	}
