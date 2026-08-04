@@ -75,9 +75,10 @@ func defaultMongoshTgz() string {
 	return fmt.Sprintf("https://downloads.mongodb.com/compass/mongosh-%s-linux-x64.tgz", mongoshVersion)
 }
 
-// resolveTools finds each binary on PATH or in toolDir, downloading the MongoDB
-// tarballs into toolDir when missing (unless skipDownload). The orchestrator binary
-// must be provided (shipped alongside the harness).
+// resolveTools finds the MongoDB binaries on PATH or in toolDir, downloading the
+// tarballs into toolDir when missing (unless skipDownload). Driver binaries
+// (orchestrator / scaffold) are resolved lazily by the chosen driver, so a
+// scaffold-only run does not require the orchestrator to be present.
 func resolveTools(toolDir string, skipDownload bool) (*tools, error) {
 	if err := os.MkdirAll(toolDir, 0o755); err != nil {
 		return nil, err
@@ -93,10 +94,6 @@ func resolveTools(toolDir string, skipDownload bool) (*tools, error) {
 		return nil, err
 	}
 	if t.mongosync, err = ensureBinary("mongosync", toolDir, envOr("HARNESS_MONGOSYNC_TGZ", defaultMongosyncTgz()), "bin/mongosync", skipDownload); err != nil {
-		return nil, err
-	}
-	// Orchestrator: PATH, toolDir, or next to the harness executable.
-	if t.orchestrator, err = locateOrchestrator(toolDir); err != nil {
 		return nil, err
 	}
 	return t, nil
