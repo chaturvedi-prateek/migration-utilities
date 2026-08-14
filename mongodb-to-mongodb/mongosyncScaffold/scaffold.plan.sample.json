@@ -1,0 +1,112 @@
+{
+  "mongosyncBinary": "mongosync",
+  "mongoshBinary": "mongosh",
+  "basePort": 27182,
+
+  "plan": {
+    "steps": [
+      {
+        // Phase 1: parallel 1:1 lift of all 6 on-prem clusters to dedicated Atlas clusters.
+        // commit=hold means mongosync reaches steady-state and WAITS — run commit.sh
+        // for all 6 together once the app cutover window is agreed.
+        "name": "lift",
+        "mode": "parallel",
+        "commit": "hold",
+        "jobs": [
+          {
+            "id": "cluster01",
+            "source":      "mongodb://<miguser>:<pwd>@<src01>:27017/?replicaSet=rs01&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app1" } ]
+          },
+          {
+            "id": "cluster02",
+            "source":      "mongodb://<miguser>:<pwd>@<src02>:27017/?replicaSet=rs02&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster02.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app2" } ]
+          },
+          {
+            "id": "cluster03",
+            "source":      "mongodb://<miguser>:<pwd>@<src03>:27017/?replicaSet=rs03&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster03.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app3" } ]
+          },
+          {
+            "id": "cluster04",
+            "source":      "mongodb://<miguser>:<pwd>@<src04>:27017/?replicaSet=rs04&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster04.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app4" } ]
+          },
+          {
+            "id": "cluster05",
+            "source":      "mongodb://<miguser>:<pwd>@<src05>:27017/?replicaSet=rs05&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster05.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app5" } ]
+          },
+          {
+            "id": "cluster06",
+            "source":      "mongodb://<miguser>:<pwd>@<src06>:27017/?replicaSet=rs06&authSource=admin",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster06.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app6" } ]
+          }
+        ]
+      },
+      {
+        // Phase 2: sequential fan-in — clusters 02-06 merge into the hub (cluster01).
+        // Cluster 01 is the hub; its app traffic continues uninterrupted throughout
+        // because preExistingDestinationData=true disables hub write-blocking.
+        //
+        // Run one merge at a time per RUNBOOK.md:
+        //   cleanup-metadata → start-processes → start-api → progress →
+        //   commit → stop → verify → repoint app → next merge
+        // After the final merge, run cleanup-metadata.sh (no arg) to clean the hub.
+        "name": "consolidate",
+        "mode": "sequential",
+        "commit": "auto",
+        "verify": true,
+        "jobs": [
+          {
+            "id": "merge-cluster02",
+            "source":      "mongodb+srv://<miguser>:<pwd>@cluster02.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app2" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ]
+          },
+          {
+            "id": "merge-cluster03",
+            "source":      "mongodb+srv://<miguser>:<pwd>@cluster03.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app3" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ]
+          },
+          {
+            "id": "merge-cluster04",
+            "source":      "mongodb+srv://<miguser>:<pwd>@cluster04.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app4" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ]
+          },
+          {
+            "id": "merge-cluster05",
+            "source":      "mongodb+srv://<miguser>:<pwd>@cluster05.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app5" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ]
+          },
+          {
+            "id": "merge-cluster06",
+            "source":      "mongodb+srv://<miguser>:<pwd>@cluster06.xxxxx.mongodb.net/?retryWrites=true",
+            "destination": "mongodb+srv://<miguser>:<pwd>@cluster01.xxxxx.mongodb.net/?retryWrites=true",
+            "includeNamespaces": [ { "database": "db_app6" } ],
+            "preExistingDestinationData": true,
+            "cleanupMetadataOn": [ "source", "destination" ]
+          }
+        ]
+      }
+    ]
+  }
+}
