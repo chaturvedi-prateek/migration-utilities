@@ -31,7 +31,8 @@ mongosyncScaffold gen-all --config migration.json --out ./migration --step lift
 ```
 
 The config is the same plan file the orchestrator uses (`plan.steps[]` of jobs, or the
-legacy `syncs[]`/`consolidation` shape).
+legacy `syncs[]`/`consolidation` shape). See `scaffold.plan.sample.json` for the
+annotated plan format, or `scaffold.sample.json` for the legacy format.
 
 ## What it writes (per step, under `<out>/<step>/`)
 

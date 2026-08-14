@@ -1,0 +1,39 @@
+{
+  // Legacy config for mongosyncScaffold — two top-level blocks (syncs + consolidation)
+  // that are equivalent to the plan-style scaffold.plan.sample.json.
+  // Use scaffold.plan.sample.json for new configs; this shape is kept for compatibility.
+  "mongosyncBinary": "mongosync",
+  "mongoshBinary": "mongosh",
+  "basePort": 27182,
+
+  // Phase 1: 1:1 parallel lifts (one per source cluster, commit=hold implied).
+  "syncs": [
+    {
+      "id": "cluster01",
+      "source":      "mongodb://<user>:<pwd>@<src01-host>:27017/?replicaSet=<rs01>&authSource=admin",
+      "destination": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+      "includeNamespaces": [ { "database": "db_a" } ]
+    },
+    {
+      "id": "cluster02",
+      "source":      "mongodb://<user>:<pwd>@<src02-host>:27017/?replicaSet=<rs02>&authSource=admin",
+      "destination": "mongodb+srv://<user>:<pwd>@<atlas02>.xxxxx.mongodb.net/?retryWrites=true",
+      "includeNamespaces": [ { "database": "db_b" } ]
+    }
+    // ... one entry per source cluster
+  ],
+
+  // Phase 2: sequential fan-in into the hub (atlas01).
+  // preExistingDestinationData and cleanupMetadataOn are set automatically by the shim.
+  "consolidation": {
+    "hub": "mongodb+srv://<user>:<pwd>@<atlas01>.xxxxx.mongodb.net/?retryWrites=true",
+    "merges": [
+      {
+        "id": "merge-cluster02",
+        "source": "mongodb+srv://<user>:<pwd>@<atlas02>.xxxxx.mongodb.net/?retryWrites=true",
+        "includeNamespaces": [ { "database": "db_b" } ]
+      }
+      // ... one entry per remaining cluster
+    ]
+  }
+}
