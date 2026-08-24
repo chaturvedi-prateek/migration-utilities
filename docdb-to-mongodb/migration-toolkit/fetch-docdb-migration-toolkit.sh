@@ -502,7 +502,10 @@ elif [[ "$OS_MATCH" != "true" ]]; then
   case "$TARGET_OS" in
     ubuntu2204) PKG_CMD="apt-get install -y tmux screen procps curl docker.io containerd runc" ;;
     amazon2)    PKG_CMD="amazon-linux-extras install -y docker && yum install -y tmux screen procps-ng curl" ;;
-    *)          PKG_CMD="dnf install -y tmux screen procps-ng curl docker containerd runc" ;;
+    # rhel9/amazon2023 ship curl-minimal by default, which hard-conflicts with
+    # the full curl package — curl-minimal already satisfies our plain-HTTPS
+    # needs, so it is deliberately left alone rather than swapped.
+    *)          PKG_CMD="dnf install -y tmux screen procps-ng docker containerd runc" ;;
   esac
   cat > "${PKGDIR}/NEEDED-OS-PACKAGES.txt" <<EOF
 These OS packages are NOT in this bundle and must be installed on the migration
@@ -512,7 +515,9 @@ so dependency resolution would have produced the wrong packages.
 
   tmux (or screen)         persistent session for long-running workers/runner
   procps-ng/procps         provides watch(1), used by the progress monitor loop
-  curl                     dsynct progress API calls (/progress)
+  curl                     dsynct progress API calls (/progress) — already
+                           present as curl-minimal on rhel9/amazon2023; do not
+                           install full curl there, it conflicts with it
   docker, containerd, runc container engine — required to run the
                            Temporal + dsynct multi-worker topology
 
@@ -525,13 +530,22 @@ container) so dependency resolution sees the same base packages the
 migration host already has.
 EOF
 else
+  # rhel9/amazon2023 ship curl-minimal by default, which hard-conflicts with
+  # the full curl package (both provide /usr/bin/curl) — dnf refuses to
+  # install the two together. curl-minimal already covers everything this
+  # toolkit needs curl for (plain HTTPS GETs), so it is left alone there.
+  case "$TARGET_OS" in
+    rhel9|amazon2023) CURL_PKG="" ;;
+    *)                CURL_PKG="curl" ;;
+  esac
+
   if [[ "$SKIP_DOCKER_ENGINE" == "true" ]]; then
-    PKG_NAMES="tmux screen procps-ng curl"
-    log "downloading OS packages (tmux, screen, procps-ng/procps, curl)"
+    PKG_NAMES="tmux screen procps-ng ${CURL_PKG}"
+    log "downloading OS packages (tmux, screen, procps-ng/procps${CURL_PKG:+, curl})"
     log "skipping Docker engine (--skip-docker-engine): target host already has docker/podman"
   else
-    PKG_NAMES="tmux screen procps-ng curl docker containerd runc"
-    log "downloading OS packages (tmux, screen, procps-ng/procps, curl, docker engine)"
+    PKG_NAMES="tmux screen procps-ng ${CURL_PKG} docker containerd runc"
+    log "downloading OS packages (tmux, screen, procps-ng/procps${CURL_PKG:+, curl}, docker engine)"
     [[ "$TARGET_OS" == "amazon2" ]] && \
       amazon-linux-extras enable docker >/dev/null 2>&1 \
       || warn "could not enable the amazon-linux-extras docker topic"
