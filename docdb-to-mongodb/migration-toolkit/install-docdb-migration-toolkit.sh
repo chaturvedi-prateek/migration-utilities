@@ -383,9 +383,25 @@ SOFT_MISSING=()
 command -v watch >/dev/null 2>&1 \
   && ok "$(printf '%-20s' watch) $(watch --version 2>&1 | head -n1)" \
   || SOFT_MISSING+=("watch")
-if   command -v tmux   >/dev/null 2>&1; then ok "$(printf '%-20s' tmux)   $(tmux -V)"
-elif command -v screen >/dev/null 2>&1; then ok "$(printf '%-20s' screen) $(screen --version 2>&1 | head -n1)"
-else SOFT_MISSING+=("tmux/screen")
+# `command -v` only proves the binary is on PATH, not that it runs — a tmux
+# built against a newer ncurses/libtinfo ABI than what's on an older AMI
+# installs fine but crashes with a symbol lookup error at execution time.
+# Actually invoke it and fall through to screen if it fails.
+TMUX_OUT=""
+if command -v tmux >/dev/null 2>&1; then
+  if TMUX_OUT="$(tmux -V 2>&1)"; then
+    :
+  else
+    warn "$(printf '%-20s' tmux) installed but not runnable (${TMUX_OUT}) — falling back to screen"
+    TMUX_OUT=""
+  fi
+fi
+if [[ -n "$TMUX_OUT" ]]; then
+  ok "$(printf '%-20s' tmux) ${TMUX_OUT}"
+elif command -v screen >/dev/null 2>&1; then
+  ok "$(printf '%-20s' screen) $(screen --version 2>&1 | head -n1)"
+else
+  SOFT_MISSING+=("tmux/screen")
 fi
 
 echo
