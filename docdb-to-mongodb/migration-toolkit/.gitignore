@@ -1,0 +1,5 @@
+# Licensed Enterprise dsynct binaries — never commit these.
+vendor/
+# Bundles produced by fetch-docdb-migration-toolkit.sh contain them too.
+docdb-migration-toolkit-*.tar.gz
+docdb-migration-toolkit-*.tar.gz.sha256
