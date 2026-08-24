@@ -203,6 +203,9 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "${PKGDIR}"/payload/{dsynct,images,tools,configs} \
          "${PKGDIR}/os-packages" "${PKGDIR}/compose"
 mkdir -p "$OUTDIR"
+# Resolve to an absolute path: the checksum step below cd's into $OUTDIR, and a
+# relative path (e.g. "./dist") would then be re-joined against the new cwd.
+OUTDIR="$(cd "$OUTDIR" && pwd)"
 
 fetch() {  # fetch <url> <dest>
   local url="$1" dest="$2"
