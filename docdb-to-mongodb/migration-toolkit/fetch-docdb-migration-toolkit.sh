@@ -462,17 +462,21 @@ EOF
 # ------------------------------------------------------------- OS packages ---
 # tmux/screen, watch(procps-ng), curl, and the Docker engine all have
 # shared-library dependencies, so unlike the tarballs above they need real
-# packages. Dependency resolution is only correct when this bastion runs the
-# SAME OS as the target — and, critically, when it is a real booted instance
-# of that OS (an EC2 instance, a VM), not a minimal container image. A minimal
-# container lacks systemd/glibc/dbus/pam/python3 et al. by design (no init
-# system), so `dnf/yumdownloader --resolve --alldeps` on one treats those as
-# "missing" and drags in ~100 base-OS packages that a real instance already
-# has — verified while building this script: resolving just tmux+screen+
-# procps-ng+curl in a bare container pulled in 92 packages, resolving
-# docker+containerd+runc pulled in 153. Every one of the extras was a base-OS
-# package (glibc, systemd, python3, rpm, selinux-policy, ...) that must never
-# be shipped in this bundle and blind-installed over a live host's own copy.
+# packages.
+#
+# For amazon2023, these are fetched directly over HTTPS from the Amazon Linux
+# repo's own metadata (repodata/primary.xml.gz) — no dnf, no matching bastion
+# OS, no container required. This works from ANY host with internet access
+# (verified: resolves the exact same package/version set dnf itself picks).
+# rhel9/amazon2/ubuntu2204 still use their package manager's --resolve, gated
+# on the bastion running the SAME OS as the target, because dependency
+# resolution on a MISMATCHED or minimal-container bastion massively
+# over-reports what is "missing" — verified while building this script:
+# resolving tmux+screen+procps-ng+curl in a bare container pulled in 92
+# packages, docker+containerd+runc pulled in 153, and every extra was a
+# base-OS package (glibc, systemd, python3, rpm, selinux-policy, ...) that
+# must never be shipped in this bundle and blind-installed over a live host's
+# own copy.
 BASTION_OS="$(detect_os 2>/dev/null || true)"
 BASTION_OS="${BASTION_OS:-unknown}"
 OS_MATCH="false"
@@ -494,8 +498,85 @@ filter_rpm_stage() {  # filter_rpm_stage <dir> — keep only allowlisted, native
   done
 }
 
+# amazon2023 packages this toolkit needs (curl-minimal, already on every
+# amazon2023 host, covers the "curl" requirement — see the CURL_PKG note
+# below — so it is deliberately not in this list).
+AL2023_PKG_NAMES="tmux screen procps-ng docker containerd runc container-selinux libcgroup libseccomp libnftnl libmnl libnetfilter_conntrack libnfnetlink iptables-libs iptables-nft pigz xfsprogs device-mapper device-mapper-libs"
+
+# Resolves exact package NVRs directly from the Amazon Linux 2023 repo's own
+# metadata over plain HTTPS — no dnf, no container, works on any host with
+# internet (verified to return the identical package/version set `dnf
+# download --resolve --alldeps` does). $PKG_NAMES is a space-separated list;
+# packages not needed on this run (e.g. docker when --skip-docker-engine) are
+# simply absent from that list, so nothing extra is ever staged.
+fetch_al2023_rpms() {  # fetch_al2023_rpms <arch> <destdir> <pkg names...>
+  local arch="$1" dest="$2"; shift 2
+  local mirror_list="https://cdn.amazonlinux.com/al2023/core/mirrors/latest/${arch}/mirror.list"
+  local base
+  base="$(curl -fsSL "$mirror_list" | head -n1)"
+  [[ -n "$base" ]] || { warn "could not resolve the amazon2023 ${arch} repo mirror"; return 1; }
+  local primary_gz="${dest}/.primary.xml.gz"
+  fetch "${base}repodata/primary.xml.gz" "$primary_gz" || return 1
+
+  local resolver; resolver="$(mktemp)"
+  cat > "$resolver" <<'PYEOF'
+import sys, gzip, xml.etree.ElementTree as ET
+NS = {'c': 'http://linux.duke.edu/metadata/common'}
+def vertup(ver, rel):
+    def parts(s):
+        return [(0, int(c)) if c.isdigit() else (1, c) for c in s.replace('-', '.').split('.')]
+    return parts(ver) + parts(rel)
+base, arch, primary_gz = sys.argv[1], sys.argv[2], sys.argv[3]
+names = set(sys.argv[4:])
+with open(primary_gz, 'rb') as f:
+    root = ET.fromstring(gzip.decompress(f.read()))
+best = {}
+for pkg in root.findall('c:package', NS):
+    name = pkg.findtext('c:name', namespaces=NS)
+    if name not in names or pkg.findtext('c:arch', namespaces=NS) not in (arch, 'noarch'):
+        continue
+    v = pkg.find('c:version', NS)
+    key = vertup(v.get('ver'), v.get('rel'))
+    if name not in best or key > best[name][0]:
+        best[name] = (key, base + pkg.find('c:location', NS).get('href'))
+missing = names - set(best)
+for name, (_, url) in sorted(best.items()):
+    print(f"{name}\t{url}")
+if missing:
+    print("MISSING:" + ",".join(sorted(missing)), file=sys.stderr)
+PYEOF
+  local resolved rc=0
+  resolved="$(python3 "$resolver" "$base" "$arch" "$primary_gz" "$@")" || rc=1
+  rm -f "$resolver" "$primary_gz"
+  [[ $rc -eq 0 ]] || { warn "amazon2023 repo metadata parse failed"; return 1; }
+
+  while IFS=$'\t' read -r name url; do
+    [[ -n "$name" ]] || continue
+    fetch "$url" "${dest}/$(basename "$url")" || warn "failed to download ${name}"
+  done <<< "$resolved"
+}
+
 if [[ "$SKIP_OS_PACKAGES" == "true" ]]; then
   log "skipping OS packages (--skip-os-packages)"
+elif [[ "$TARGET_OS" == "amazon2023" ]]; then
+  PKG_NAMES="$AL2023_PKG_NAMES"
+  [[ "$SKIP_DOCKER_ENGINE" == "true" ]] && PKG_NAMES="tmux screen procps-ng"
+  log "downloading amazon2023 OS packages directly from the AL2023 repo (no dnf needed)"
+  # shellcheck disable=SC2086
+  fetch_al2023_rpms "$ARCH" "${PKGDIR}/os-packages" $PKG_NAMES \
+    || warn "amazon2023 direct package download failed; stage packages manually (see NEEDED-OS-PACKAGES.txt)"
+  if ! compgen -G "${PKGDIR}/os-packages/*.rpm" > /dev/null; then
+    cat > "${PKGDIR}/NEEDED-OS-PACKAGES.txt" <<EOF
+Direct download from the amazon2023 repo failed (no internet on this bastion,
+or the repo endpoint changed). Install these on the migration host instead:
+
+  dnf install -y tmux screen procps-ng docker containerd runc
+
+curl is deliberately not listed: amazon2023 ships curl-minimal by default,
+which conflicts with the full curl package. curl-minimal already covers
+everything this toolkit needs curl for.
+EOF
+  fi
 elif [[ "$OS_MATCH" != "true" ]]; then
   warn "bastion OS '${BASTION_OS}' != target OS '${TARGET_OS}'."
   warn "Skipping tmux/screen/procps/curl/docker download: dependency resolution would be wrong."
@@ -556,7 +637,7 @@ else
   # into the bundle regardless of which tool triggered its resolution.
   RPM_STAGE="$(mktemp -d)"
   case "$TARGET_OS" in
-    rhel9|amazon2023)
+    rhel9)
       if command -v dnf >/dev/null 2>&1; then
         dnf -y install dnf-plugins-core >/dev/null 2>&1 || true
         # shellcheck disable=SC2086
