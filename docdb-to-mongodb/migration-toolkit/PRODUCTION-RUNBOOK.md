@@ -308,6 +308,160 @@ docker compose exec temporal temporal activity unpause \
 
 ---
 
+## 5.1 Enabling debug logs
+
+`worker` and `runner` run in dsynct's **chained "app" mode** (no
+`DSYNCT_MODE=simple`) — this exposes a completely different CLI surface than
+the "simple" mode used for `verify`/`sync`/etc. in §8. In chained mode,
+`--log-level` is NOT a top-level global flag — it belongs to the `app`
+sub-command specifically, which appears at the *end* of the chain in both
+`worker` and `runner`'s `command:` list.
+
+**Wrong** (fails with `flag provided but not defined: -log-level`):
+```yaml
+command:
+  - --log-level=DEBUG   # top-level position — rejected
+  - worker
+  ...
+```
+
+**Right** — add it to the `app` leg of the chain:
+```yaml
+  worker:
+    command:
+      - worker
+      - "--queue-name=${QUEUE:?set QUEUE in .env}"
+      - "--concurrent-activities=${CONCURRENT_ACTIVITIES:-4}"
+      - "--sync-writer-workers=${SYNC_WRITER_WORKERS:-8}"
+      - "--per-stream-workers=${PER_STREAM_WORKERS:-4}"
+      - --pause-on-error
+      - "${DOCDB_SRC:?set DOCDB_SRC in .env}"
+      - "--doc-partition=${DOC_PARTITION:-500000}"
+      - "--namespace-fanout=${NAMESPACE_FANOUT:-100}"
+      - "--documentdb-sampling-fanout=${DOCUMENTDB_SAMPLING_FANOUT:-100}"
+      - "${MDB_DEST:?set MDB_DEST in .env}"
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --log-level=DEBUG   # <-- here, after `app`
+      - --no-progress
+
+  runner:
+    command:
+      - run
+      - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
+      - "--queue-name=${QUEUE:?set QUEUE in .env}"
+      - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --log-level=DEBUG   # <-- here, after `app`
+      - --host-port=0.0.0.0:8080
+      - --persist
+```
+Apply and tail:
+```bash
+docker compose up -d --force-recreate worker runner
+docker compose logs -f worker
+```
+
+`DEBUG` surfaces useful internals not shown at `INFO`, e.g. the live change-stream
+namespace filter regex:
+```
+DEBUG Change stream namespace filter: {"$and":[{"ns.db":{"$regex":{"$regularExpression":{"pattern":"^(?!local$|config$|admin$|adiom-internal$)","options":""}}}},{"ns.coll":{"$regex":{"$regularExpression":{"pattern":"^(?!system.)","options":""}}}}]}
+```
+
+Docker's own on-disk log file backing `docker compose logs` (useful for `grep`/
+long-term retention regardless of dsynct's own verbosity):
+```bash
+sudo cat /var/lib/docker/containers/$(docker compose ps -q worker)/*-json.log | jq -r '.log'
+```
+
+---
+
+## 5.2 Full CLI reference — chained "app" mode (`worker` / `runner` / `temporal` / `app`)
+
+This is the mode actually used by the running topology (no `DSYNCT_MODE=simple`).
+Captured live via `docker run --rm dsynct:enterprise <subcommand> --help`.
+
+### `worker` — registers source→destination sync flow workers with Temporal
+```
+USAGE: dsynct worker [command options] source [source options] destination [destination options] [transformer] [transformer options]
+
+--queue-name value                       Temporal queue name (default: "dsync")
+--transform                              set if a transformer follows source+destination (default: false)
+--concurrent-activities value            concurrent Temporal activities for this worker (default: 4)
+--sync-transform-workers value           workers for transformer during initial sync (default: 1)
+--sync-writer-workers value              workers writing to destination during initial sync (default: 1)
+--per-stream-workers value               workers writing to destination per change stream (default: 1)
+--stream-writer-max-batch-size value     max batch size for change stream worker (default: 0)
+--buffer-size value                      reader -> writer/transformer buffer size, initial sync (default: 0)
+--transformer-buffer-size value          transformer -> writer buffer size (default: 0)
+--stream-buffer-size value               change stream buffer size (default: 0)
+--stream-worker-buffer-size value        per-stream-worker buffer size (default: 100)
+--heartbeat-interval value               heartbeat/progress interval to Temporal (default: 20s)
+--stream-update-interval value           stream cursor progress update interval (default: 15s)
+--src-data-type value                    source data type, inferred if unset
+--dst-data-type value                    destination data type, inferred if unset
+--namespace-mapping value [...]          fully-qualified namespace mapping src -> dst, applied before transform
+--ignore-write-failures                  ignore write failures instead of failing the activity (default: false)
+--pause-on-error                         pause the Temporal activity on error instead of auto-retry (default: false)
+--attempts-before-pause value            attempts before pausing, if --pause-on-error set (default: 0)
+--mapping-delimiter value                delimiter for namespace mappings (default: ":")
+```
+
+### `run` — submits a flow execution to Temporal and monitors progress (the `runner` service)
+```
+USAGE: dsynct run [command options]
+
+--workflow-id value                identifies a unique resumable flow execution
+--queue-name value                 Temporal queue (default: picks up worker's queue if unset; else "dsync")
+--initial-sync-queue-name value    override queue for initial-sync tasks
+--stream-queue-name value          override queue for streaming activities
+--namespace value [...]            namespaces to execute the flow for (repeatable)
+--skip-initial-sync                (default: false)
+--skip-change-stream               (default: false)
+--heartbeat-timeout value          Temporal heartbeat timeout — must exceed worker's --heartbeat-interval (default: 1m0s)
+--terminate-existing               terminate any existing execution with same workflow-id, then start fresh (default: false)
+--cancel-existing                  cancel any existing execution with same workflow-id, then start fresh (default: false)
+--progress-check-interval value    interval to poll Temporal for heartbeat progress (default: 9s)
+--progress-publish-interval value  interval to push collected progress (default: 10s)
+--max-partitions value             split initial sync into multiple workflows above this partition count (default: 0, unlimited)
+```
+
+### `app` — configure app runtime (progress server, logging, otel) — appears once per chain, after `temporal`
+```
+USAGE: dsynct app [command options]
+
+--log-level value               (default: "INFO")   <-- set to DEBUG here for verbose logs
+--otel                           export logs/metrics to Otel; needs OTEL_EXPORTER_OTLP_ENDPOINT env (default: false)
+--otel-metric-interval value    push interval if --otel set (default: 0s)
+--otel-service-name value       service name for otel (default: "dsynct")
+--pprof-host-port value         host:port to expose pprof
+--host-port value                address for the web progress dashboard (default: "localhost:8080")
+--progress-refresh value        interval between progress pushes (default: 1s)
+--graceful-exit-timeout value   time allowed for graceful shutdown (default: 15s)
+--persist                        keep progress server running after runs complete (default: false) — used by runner
+--no-progress                    do not run a progress server at all (default: false) — used by worker, since the runner already serves :8080
+```
+
+### `temporal` — configure the Temporal connection (once per chain)
+```
+USAGE: dsynct temporal [command options]
+
+--host-port value   address of the Temporal instance
+--namespace value   Temporal namespace to use (default: "default")
+```
+
+Note: this chained-mode CLI is distinct from the **"simple" mode**
+(`-e DSYNCT_MODE=simple`) used for one-shot commands like `verify`,
+`sync`, `sample-ids`, `verify-ids`, `connectors` — see §8 for those, and note
+that in simple mode `--log-level` IS a genuine top-level global flag (it sits
+alongside `--otel`, `--host-port`, `--pprof-host-port` at the root, not nested
+under `app`).
+
+---
+
 ## 6. Scaling workers live
 
 Add workers — new replicas immediately start pulling pending partition tasks,
