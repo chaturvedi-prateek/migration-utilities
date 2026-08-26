@@ -286,6 +286,108 @@ or directly if the security group allows it.
 
 ---
 
+## 4.1 CDC architecture and tuning — lessons learned (validated live on the POC)
+
+### A single change stream is pinned to ONE worker container — scaling worker
+### *count* does not speed up CDC once initial sync is done
+
+The dashboard's Change Stream Progress table showed a single row
+(`Index 0, Namespaces: All`) — Temporal assigns that one `dsync_StreamChanges`
+activity to exactly one worker process. Confirmed via `docker stats`: with 6
+worker replicas running, 5 sat at **0.00% CPU** while the one holding the
+activity ran at **300%+ CPU** (3 cores). Scaling `docker compose up -d --scale
+worker=N` only helps during initial sync (parallelizable across many doc
+partitions); it does **nothing** for change-stream throughput once initial
+sync is 100% complete. Don't waste time adding more worker replicas to fix a
+CDC bottleneck — check the CPU on the specific container actually running the
+stream activity instead (`docker stats`, cross-referenced against
+`temporal workflow describe` to see which `identity`/worker owns
+`dsync_StreamChanges`).
+
+### What actually moves CDC throughput
+
+Levers that scale the *writer* side of a single change stream (edit in
+`.env` / the `worker` service's `command:`, then
+`docker compose up -d --force-recreate worker` — this resumes from the
+stored heartbeat/cursor, it does not restart from zero):
+```
+--per-stream-workers=<N>              # default 4 — writer pool for this stream
+--stream-writer-max-batch-size=<N>    # not in the generated compose template by
+                                       # default — add it manually; default 0 (unbounded)
+--stream-buffer-size=<N>              # default 0
+--stream-worker-buffer-size=<N>       # default 100
+```
+**Rule of thumb for `--per-stream-workers`:** don't exceed the host's core
+count (`nproc`). Oversubscribing threads on an already CPU-bound process adds
+scheduling overhead without adding real parallelism — check `docker stats`
+for the owning container's CPU% first. On the POC host (16 cores), the
+change-stream worker was only using ~3 cores (300% CPU) even at
+`--per-stream-workers=12`, meaning host CPU was NOT the bottleneck — see
+below for where the real ceiling was.
+
+### If tuning worker-side flags doesn't move throughput, look downstream —
+### the bottleneck may be Atlas write capacity or DocumentDB read capacity,
+### not dsync configuration at all
+
+Live example: bumping `--per-stream-workers` 4→12 and adding
+`--stream-writer-max-batch-size=1000` did NOT increase throughput (stayed
+flat around 18k ops/sec, down slightly from an earlier 36k ops/sec peak)
+despite the owning worker container having 13 idle cores of headroom. When
+host CPU is not saturated but throughput won't climb, check:
+- **Atlas Metrics** (source of the actual write ceiling): `Opcounters`
+  (insert/update rate), `Normalized System CPU`, disk IOPS — if these are
+  flat/saturated regardless of dsync-side tuning, you need a bigger Atlas
+  tier, not more dsync tuning.
+- **DocumentDB Console → Monitoring**: `CPUUtilization`, `ReadIOPS` — a busy
+  source can throttle change-stream read-ahead independent of anything on
+  the dsync/EC2 side.
+- **Network**: `iftop`/`nload` on the migration host, in case the EC2
+  instance's NIC is saturated between the host and both clusters.
+
+### Reading the Change Stream Progress table correctly
+
+| Column | Meaning |
+|---|---|
+| `Events Read` − `Events Written` | current backlog. Growing = destination writer falling behind; shrinking/stable = healthy. |
+| `Latency` | gap between an event being read and being written — watch it trend down, not just its absolute value. |
+| `Throughput` | ops/sec **for the current interval only** — 0 ops/sec when caught up simply means no new source writes are landing right now, not that the stream died. |
+| `Last Event` | wall-clock timestamp of the most recently processed source event — compare to `date -u` on the host. Within a few seconds = live and caught up. Stuck/old while source is writing = silently stalled resume token (see §1). |
+
+**Cutover-ready signature, observed live:** `Events Read == Events Written`
+(zero backlog), `Latency: 0`, `Throughput: 0 ops/sec` (nothing new to
+process), `Last Event` timestamp matching wall-clock now. Confirm this isn't
+a false "quiet" reading by checking whether the load generator/application
+writes have actually stopped (if using Locust for a load test, check the
+process is still alive — a plateaued dashboard with 0 ops/sec can equally
+mean the source-side write generator itself has stopped or errored out).
+
+### CDC writes may show as "update" ops downstream even though the source is
+### 100% inserts — this is expected, not a correctness problem
+
+CDC replication tools commonly apply destination writes as **upsert**
+(`update` with `upsert: true`) rather than raw `insert`, because change
+streams deliver at-least-once — a redelivered event must be idempotent, and
+upsert absorbs a duplicate delivery without a duplicate-key error. This means
+Atlas's `Opcounters`/Real Time metrics can show `UPDATE` ops climbing even
+when the source workload (e.g. a Locust `insert_many` load generator) is
+doing nothing but inserts with fresh `ObjectId()`s.
+
+**Confirmed live via `currentOp` on the Atlas destination** — filter by
+`appName: "dsync"` to isolate dsync's own connections from application
+traffic:
+```bash
+mongosh "$MDB_DEST" --eval 'db.getSiblingDB("admin").currentOp({"appName": "dsync"})'
+```
+Sample real output captured during active CDC: `appName: "dsync"`,
+`driver.name: "mongo-go-driver"`, `ns: "load_test_db.$cmd"`,
+`query.update: "load_test_coll"`, `query.ordered: false` — i.e. **during
+CDC, dsync is issuing a batch `update` command (unordered) against the
+collection, not raw `insert`.** This is expected/idempotent-upsert behavior,
+not a correctness problem — seeing `UPDATE` climb in Atlas `Opcounters`
+while the source is 100% inserts is normal during CDC.
+
+---
+
 ## 5. Handling paused activities
 
 Worker command includes `--pause-on-error`, and `--attempts-before-pause`
@@ -623,6 +725,80 @@ with `docker logs --tail 50 docdb-verify` / `docker ps -a | grep docdb-verify`.
 
 ---
 
+## 8.1 Create indexes on the destination (once CDC backlog is ~0, before cutover)
+
+Once the change-stream backlog has converged to ~0 (per §4.1's "cutover-ready
+signature" — `Events Read ≈ Events Written`, `Latency: 0`, `Last Event`
+matching wall-clock now), create the destination indexes using the
+`migrateIndexes` utility. It is already staged as part of this toolkit
+(`HELPER_TOOLS` in the bundle) — no separate copy step needed.
+
+Binary and sample config location (installed by
+`install-docdb-migration-toolkit.sh`):
+```
+${PREFIX}/libexec/migrateIndexes                          # e.g. /opt/docdb-migration/libexec/migrateIndexes
+${PREFIX}/configs/migrateIndexes.config.sample.json
+```
+
+**Why now, not earlier:** `create` mode deliberately neutralizes `unique`
+indexes to `unique:false` and TTL indexes to `expireAfterSeconds = MAX_INT`
+when building them on the destination. Building real `unique`/TTL indexes
+while CDC is still actively replaying inserts would risk a uniqueness
+violation on a replayed/duplicate write, or a document expiring before it's
+even been verified. Waiting until the backlog is ~0 (but still before
+cutover/stopping source writes) minimizes that window while still getting
+the index builds — usually the slowest part of a migration — done ahead of
+time instead of adding it to the cutover critical path.
+
+```bash
+cd ${PREFIX}/configs
+cp migrateIndexes.config.sample.json migrateIndexes.config.json
+```
+
+Edit `migrateIndexes.config.json` — reuse the same connection strings as
+`.env`'s `DOCDB_SRC`/`MDB_DEST`:
+```json
+{
+  "source_uri": "mongodb://<user>:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=${PREFIX}/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false",
+  "destination_uri": "mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true",
+  "databases": [],
+  "log_file": "migrateIndexes-create.log"
+}
+```
+`databases: []` auto-discovers every non-system database — leave empty
+unless scoping to specific DBs.
+
+Dry run first — always:
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=true
+```
+Review the printed list of indexes it would create (unique/TTL shown
+neutralized), then apply:
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false --concurrency=8
+```
+(`--concurrency` default 8; raise on a bigger Atlas tier with headroom,
+lower if you see connection-pool/server-selection timeouts. MongoDB
+serializes multiple index builds on the *same* collection regardless of
+this setting — it only parallelizes across different collections.)
+
+Verify (read-only, safe to run anytime):
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=verify
+```
+At this stage expect `PENDING` on the unique/TTL indexes — that's the
+neutralized state and is correct, not a failure. Exit code `4` (INCOMPLETE)
+is expected right now; a real problem is exit code `3`
+(`MISMATCH`/`MISSING`/`EXTRA`).
+
+**Post-cutover** (after source writes have genuinely stopped and CDC has
+fully drained for real, not just momentarily): run `--mode=rectify` to
+restore real `unique:true` and original TTL values, then `verify` again
+expecting `PASS` (exit code `0`). See §9 for where this fits in the overall
+cutover sequence.
+
+---
+
 ## 9. Cutover sequence
 
 A full `verify` pass over a large collection takes hours, not minutes — it
@@ -637,18 +813,46 @@ Don't start a fresh `verify` run as part of the cutover steps themselves.
    why partial-pass output isn't trustworthy) and `mismatchCount` has
    settled at `0`, the data is confirmed consistent. This is your green
    light to schedule the actual cutover.
-3. Stop writes on DocumentDB (app-level maintenance mode, or block at the
-   security-group level).
-4. Confirm CDC lag has drained to 0 — check `workflow describe`'s
-   `dsync_StreamChanges` heartbeat repeatedly; `EventsRead` should stop
-   climbing and the cursor should stabilize once no new writes occur.
-5. Restore unique indexes and correct TTL settings:
+3. Create destination indexes now if not already done (§8.1) — do this
+   *before* stopping writes, while CDC backlog is ~0, so index builds don't
+   sit on the cutover critical path:
    ```bash
-   migrateIndexes --config <config.json> --mode=rectify --dry-run=false
+   ${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
    ```
-6. Switch the application's connection string to Atlas.
-7. Cancel/terminate the Temporal workflow once cutover is confirmed stable.
-8. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
+4. **Stop writes on DocumentDB** (app-level maintenance mode, or block at the
+   security-group level). This is the actual start of the cutover window.
+5. Confirm CDC lag has drained to 0 — check `workflow describe`'s
+   `dsync_StreamChanges` heartbeat repeatedly; `EventsRead` should stop
+   climbing and the cursor should stabilize once no new writes occur (same
+   signature as §4.1's cutover-ready check, but now against a genuinely
+   static source).
+6. **Compare document counts and indexes on both sides** now that the
+   source is frozen — this is the final correctness gate before switching
+   traffic:
+   ```bash
+   # Document counts, every DB/collection, source vs destination
+   DOCDB_SRC="$DOCDB_SRC" MDB_DEST="$MDB_DEST" fullCountVerify.sh
+   # (or, if not symlinked onto PATH: ${PREFIX}/libexec/fullCountVerify.sh)
+
+   # Index parity, including that unique/TTL are still neutralized
+   # (expected PENDING/INCOMPLETE until step 7 below)
+   migrateIndexes --config migrateIndexes.config.json --mode=verify
+   ```
+   `fullCountVerify.sh` (staged as part of this toolkit — reuses the same
+   `$DOCDB_SRC`/`$MDB_DEST` env vars as everything else) walks every
+   non-system database/collection on the source, runs
+   `estimatedDocumentCount()` against the matching collection on the
+   destination, and prints a `PASS`/`FAIL` line per collection plus a
+   summary count. Any `FAIL` here means don't proceed — investigate before
+   cutting over, don't just retry the comparison.
+7. Restore unique indexes and correct TTL settings:
+   ```bash
+   migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
+   ```
+   Then re-run `verify` and expect `PASS` (exit code `0`).
+8. Switch the application's connection string to Atlas.
+9. Cancel/terminate the Temporal workflow once cutover is confirmed stable.
+10. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
 
 ---
 
@@ -674,10 +878,16 @@ docker compose up -d runner
 # --- Monitor (repeat throughout) ---
 docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
 
+# --- Create destination indexes (once CDC backlog ~0, BEFORE stopping writes — §8.1) ---
+migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
+
 # --- Cutover ---
 # (stop source writes externally)
 docker run --rm --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise verify --report-limit 50 --parallelism 8 --skip-change-stream "$DOCDB_SRC" "$MDB_DEST"
-migrateIndexes --config <config.json> --mode=rectify --dry-run=false
+fullCountVerify.sh                                                          # count parity, source vs destination
+migrateIndexes --config migrateIndexes.config.json --mode=verify           # index parity (expect PENDING pre-rectify)
+migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
+migrateIndexes --config migrateIndexes.config.json --mode=verify           # expect PASS now
 # (switch app to Atlas)
 docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> --reason "cutover complete"
 ```

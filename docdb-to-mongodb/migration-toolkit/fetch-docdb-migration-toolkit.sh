@@ -187,6 +187,12 @@ HELPER_CONFIGS=(
   "migrateIndexes:docdb-to-mongodb/indexes/migrateIndexes/config.sample.json"
   "copyMissingDocs:docdb-to-mongodb/copyMissingDocs/go/config.sample.json"
 )
+# Plain shell scripts (not per-arch ELF binaries) — staged as-is, no ELF check.
+# Driven entirely by $DOCDB_SRC / $MDB_DEST, same env vars as everything else
+# in this toolkit's .env.
+HELPER_SCRIPTS=(
+  "fullCountVerify.sh:docdb-to-mongodb/dataVerifier/fullCountVerify.sh"
+)
 
 # The script normally lives at <repo>/docdb-to-mongodb/migration-toolkit/.
 if [[ -z "$TOOLS_DIR" && -d "${SCRIPT_DIR}/../../docdb-to-mongodb" ]]; then
@@ -291,6 +297,18 @@ for spec in "${HELPERS[@]}"; do
       *ELF*64-bit*) ;;
       *) die "staged ${name} is not a 64-bit ELF binary — download likely served an error page" ;;
     esac
+  fi
+done
+
+for spec in "${HELPER_SCRIPTS[@]}"; do
+  name="${spec%%:*}"; path="${spec#*:}"
+  if [[ -n "$TOOLS_DIR" && -f "${TOOLS_DIR}/${path}" ]]; then
+    log "staging ${name} from local checkout"
+    install -m 0755 "${TOOLS_DIR}/${path}" "${PKGDIR}/payload/tools/${name}"
+  else
+    fetch "https://raw.githubusercontent.com/${TOOLS_REPO}/${TOOLS_REF}/${path}" \
+          "${PKGDIR}/payload/tools/${name}"
+    chmod +x "${PKGDIR}/payload/tools/${name}"
   fi
 done
 
@@ -694,7 +712,7 @@ JQ_VERSION="${JQ_VERSION}"
 JQ_BIN="${JQ_BIN}"
 DOCKER_COMPOSE_VERSION="${DOCKER_COMPOSE_VERSION}"
 DOCKER_COMPOSE_BIN="${DOCKER_COMPOSE_BIN}"
-HELPER_TOOLS="fixIdTypes migrateIndexes checkChangeStreams copyMissingDocs"
+HELPER_TOOLS="fixIdTypes migrateIndexes checkChangeStreams copyMissingDocs fullCountVerify.sh"
 EOF
 
 log "generating SHA256 checksums"
