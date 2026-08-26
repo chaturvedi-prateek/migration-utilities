@@ -14,7 +14,7 @@ as described, or you need a deeper explanation/full flag list.
 
 ---
 
-# PART ONE — Normal Operation (follow in order)
+# PART ONE
 
 ## 1. One-time host setup
 
