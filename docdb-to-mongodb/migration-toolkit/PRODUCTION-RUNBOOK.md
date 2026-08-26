@@ -368,6 +368,11 @@ pass:
 --total-partitions 4 --partition 0   # run this range, then repeat for 1,2,3
 ```
 
+**This is not a theoretical concern — see Part Two §T8 for a real incident**
+where `verify` OOM-killed `sshd` twice on a shared host and locked out SSH
+access, plus a lighter-weight Enterprise-native alternative
+(`sample-ids`/`verify-ids`) for very large datasets.
+
 Omit `--namespace` for all-databases verification, matching the sync scope.
 
 **Background/continuous run (includes CDC verification, runs forever):**
@@ -594,6 +599,13 @@ docker compose exec temporal temporal workflow describe --workflow-id <name>-rev
 `dsync_StreamLSN` — no `dsync_InitialSync`.** If you see an `InitialSync`
 activity, `--skip-initial-sync` didn't take effect — check the compose file
 edit and re-recreate the `runner`.
+
+The dashboard's own **Summary** panel will show `Documents Synced: 0` and
+`Namespaces Synced: 0/0` for the entire lifetime of this run — that's
+expected and benign for a `--skip-initial-sync` (CDC-only) flow, not a sign
+anything is wrong. Those fields track initial-sync progress specifically,
+which never runs here; watch the Change Stream Progress table instead (§T7
+item 3 for how to read it).
 
 ### 6. Live-fire sanity check — confirm direction and delivery
 Write to Atlas (now the source) and confirm it lands on DocumentDB (now the
@@ -1054,6 +1066,24 @@ docker compose logs -f runner
 Redoing initial sync is always safe — dsync upserts by `_id`, so a restart
 never creates duplicates, just re-matches/overwrites what's already there.
 
+**Terminating a workflow does NOT automatically submit a new run — validated
+live.** After `workflow terminate`, the `runner` container can sit `Up` for
+many minutes with no new workflow started; `run` only submits once per
+process lifetime, it doesn't watch for termination and resubmit on its own.
+You must explicitly restart/recreate it (step 3 above) to trigger a fresh
+submission. Confirm it actually happened by checking for a **new `RunId`**
+in `workflow describe`, not just that the container shows `Up`.
+
+**`docker compose restart` vs `docker compose up -d --force-recreate`:**
+- `restart` re-runs the existing container's entrypoint as-is — sufficient
+  to resubmit after a termination when nothing in `.env`/`docker-compose.yml`
+  changed.
+- If you changed `.env` or the compose file (new tuning flags, a new
+  `--skip-initial-sync`, etc.) in between, `restart` will **not** pick up
+  those changes — it doesn't reread either file. Use
+  `docker compose up -d --force-recreate <service>` instead, which rebuilds
+  the container from the current `.env`/compose file state.
+
 ---
 
 ## T7. Reverse CDC (§10) — known issues and diagnostic checklist (validated live)
@@ -1150,4 +1180,70 @@ watch -n 15 'mongosh "<dest URI>" --quiet --eval "db.getSiblingDB(\"<db>\").<sma
 ```
 Use a small test collection (e.g. `coll_cdctest`), not a multi-hundred-
 million-document production collection, so the poll query itself stays fast.
+
+---
+
+## T8. `verify` memory pressure — real incident, and a lighter-weight alternative
+
+### The incident
+
+On a shared `m5.4xlarge` host running `verify` against a ~1TB collection
+**alongside 10 active dsync worker containers**, `verify` OOM-killed
+`sshd` — **twice** — locking out SSH access to the host both times (once
+with `--report-all`, and again after switching to the supposedly lighter
+`--report-limit`). Atlas-side `iowait` also climbed to ~30% during the run.
+
+**Root cause:** `verify`'s Merkle Search Tree comparison holds a hash+ID
+entry per document across the **entire dataset**, regardless of
+`--report-limit`/`--report-all` — those flags only control how many
+*mismatches* get printed, not the underlying tree's memory footprint. On a
+1TB/hundreds-of-millions-of-document collection, that tree competes directly
+with Temporal + the worker fleet for host memory, and can starve/kill
+unrelated host processes like `sshd`.
+
+### Remediations, in order of effectiveness
+
+1. **Run `verify` on a separate, dedicated host** — not the same instance
+   running the live migration workers. This is the most reliable fix; it
+   removes the resource contention entirely.
+2. **Cgroup-limit the container** if it must share a host:
+   ```bash
+   docker run --rm --memory=8g --memory-swap=8g --network compose_default \
+     -e DSYNCT_MODE=simple dsynct:enterprise verify ...
+   ```
+3. **Chunk the workload** with `--total-partitions`/`--partition` (§7) —
+   bounds memory per run, at the cost of needing multiple sequential runs.
+4. **Lower `--parallelism`** — fewer concurrent comparison workers held in
+   memory at once.
+
+### Is there a count-only/quick-check mode to avoid this entirely?
+
+**Confirmed live (via direct `--help` inspection of the real Enterprise
+`dsynct` binary's `verify`, `sync`, and `connectors` subcommands): no.**
+`--verify-quick-count` exists on the **OSS** `dsync` tool but is **not**
+present on Enterprise `dsynct` at all. Don't spend time looking for it on
+Enterprise.
+
+### Enterprise-native bounded-memory alternative: `sample-ids` + `verify-ids`
+
+Instead of a full Merkle-tree comparison, reservoir-sample a fixed number of
+IDs from the source, then verify only those — memory is bounded by the
+sample size, not the collection size:
+```bash
+# 1. Sample N random IDs from the source
+docker run --rm --network compose_default -e DSYNCT_MODE=simple \
+  -v "$(pwd):/out" dsynct:enterprise \
+  sample-ids --namespace <db>.<coll> --count 10000 --output /out/sample-ids.jsonl \
+  "$DOCDB_SRC"
+
+# 2. Verify just those sampled IDs match on both sides
+docker run --rm --network compose_default -e DSYNCT_MODE=simple \
+  -v "$(pwd):/out" dsynct:enterprise \
+  verify-ids --namespace <db>.<coll> --id-file /out/sample-ids.jsonl \
+  "$DOCDB_SRC" "$MDB_DEST"
+```
+This trades exhaustiveness for safety — it won't catch every possible
+mismatch the way a full `verify` pass does, but it's a reasonable
+lower-risk sanity check on a host that can't safely run a full pass, or as
+a quick spot-check between full `verify` runs.
 </content>
