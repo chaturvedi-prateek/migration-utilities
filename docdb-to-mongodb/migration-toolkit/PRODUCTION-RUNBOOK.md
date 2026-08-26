@@ -7,28 +7,35 @@ mistakes, which is why the pre-flight section is non-negotiable.
 Fill in placeholders (`<...>`) before running anything. Treat this file as
 confidential once filled in — it will contain connection strings/credentials.
 
+**Structure:** Part One is the normal, start-to-finish happy path — follow it
+in order for a standard migration. Part Two is troubleshooting, tuning, and
+reference material — go there only when something in Part One doesn't behave
+as described, or you need a deeper explanation/full flag list.
+
 ---
 
-## 0. One-time host setup
+# PART ONE — Normal Operation (follow in order)
+
+## 1. One-time host setup
 
 Already done if you followed `install-docdb-migration-toolkit.sh`. Confirms
 Docker, dsynct, and helper tools are present:
 
 ```bash
-which dsynct mongosh jq fixIdTypes migrateIndexes checkChangeStreams copyMissingDocs
+which dsynct mongosh jq fixIdTypes migrateIndexes checkChangeStreams copyMissingDocs fullCountVerify.sh
 docker compose version
 docker images | grep -E "dsynct|temporal"
 ```
 
 ---
 
-## 1. Pre-flight on the DocumentDB source — DO NOT SKIP
+## 2. Pre-flight on the DocumentDB source — DO NOT SKIP
 
 **This is the step that broke the POC run for over an hour.** Change streams
 were never enabled, dsync gave no error, CDC silently did nothing while
 looking perfectly healthy. Confirm all of this *before* starting any sync.
 
-### 1.1 Enable change streams cluster-wide
+### 2.1 Enable change streams cluster-wide
 
 ```bash
 export DOCDB_SRC="mongodb://<user>:<password>@<cluster>.cluster-<id>.<region>.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=/opt/docdb-migration/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
@@ -42,7 +49,7 @@ printjson(db.getSiblingDB("admin").runCommand({ modifyChangeStreams: 1, database
 # Expect: { ok: 1, ... }
 ```
 
-### 1.2 Set change-stream retention to 7 days (covers a multi-day initial sync)
+### 2.2 Set change-stream retention to 7 days (covers a multi-day initial sync)
 
 ```bash
 aws docdb describe-db-cluster-parameters \
@@ -59,7 +66,7 @@ Note: `db.adminCommand({getParameter:1, changeStreamLogRetentionDuration:1})`
 from the base OSS plan does **not** work on DocumentDB (`Feature not
 supported: getParameter`) — always check retention via the AWS CLI instead.
 
-### 1.3 Prove change streams actually work (don't trust step 1.1's `{ok:1}` alone)
+### 2.3 Prove change streams actually work (don't trust step 2.1's `{ok:1}` alone)
 
 Terminal A:
 ```bash
@@ -75,17 +82,17 @@ Terminal B (while A is running):
 mongosh "$DOCDB_SRC" --eval 'db.getSiblingDB("<dbname>").<collection>.insertOne({probe: new Date()})'
 ```
 Terminal A must print the change event and exit. If it errors with
-`modifyChangeStreams has not been run...`, step 1.1 did not actually take —
+`modifyChangeStreams has not been run...`, step 2.1 did not actually take —
 go back and confirm with `printjson()` wrapping, not bare `use admin`.
 
-### 1.4 Confirm `_id` types are clean (mandatory — dsync fails the whole flow plan on mixed types)
+### 2.4 Confirm `_id` types are clean (mandatory — dsync fails the whole flow plan on mixed types)
 
 ```bash
 fixIdTypes --mode detect --config /opt/docdb-migration/configs/fixIdTypes.config.sample.json
 # every collection must report [CLEAN] before proceeding
 ```
 
-### 1.5 Confirm change-stream config via the toolkit's own checker
+### 2.5 Confirm change-stream config via the toolkit's own checker
 
 ```bash
 checkChangeStreams
@@ -93,7 +100,7 @@ checkChangeStreams
 
 ---
 
-## 2. Configure the migration
+## 3. Configure the migration
 
 ```bash
 cd /opt/docdb-migration/compose
@@ -146,7 +153,7 @@ Three ports matter, all defined in `compose/docker-compose.yml`:
 |------|---------|---------|------------------------|
 | `7233` | `temporal` | gRPC — workers/runner connect here | No — stays inside the Docker network on a single host. Only needed externally if you run worker containers on a **separate** EC2 host from `temporal` (multi-host scaling). |
 | `8233` | `temporal` | Temporal Web UI | Only if you want to browse workflow history/activity state directly. |
-| `8080` | `runner` | dsynct progress dashboard | Only if you want to view the React dashboard in a browser (note: it has no simple curl-able API — see §4, use `temporal workflow describe` for scripted monitoring instead). |
+| `8080` | `runner` | dsynct progress dashboard | Only if you want to view the React dashboard in a browser (note: it has no simple curl-able API — see §5, use `temporal workflow describe` for scripted monitoring instead). |
 
 **Recommended: don't open these in the security group at all — use an SSH tunnel instead.** These ports expose migration control-plane access (workflow termination, activity pausing, live data-in-flight visibility), so treat them the same as you would a database admin port:
 ```bash
@@ -209,7 +216,7 @@ Leave `NAMESPACE` unset/deleted in `.env` after this edit.
 
 ---
 
-## 3. Bring up the topology
+## 4. Bring up the topology
 
 ```bash
 docker compose up -d temporal
@@ -239,7 +246,7 @@ docker compose logs runner --tail=20   # should show "Started workflow workflow-
 
 ---
 
-## 4. Monitor progress
+## 5. Monitor progress
 
 The dsynct web dashboard (`:8080`) is a full React SPA with no simple
 REST/SSE endpoint — `curl`-ing `/progress` just returns the HTML shell
@@ -260,19 +267,13 @@ Reading `workflow describe` output:
 - `LastHeartbeatDetails` on `dsync_StreamChanges` shows `EventsRead`/`EventsWritten` and a `Cursor` —
   **if `Cursor` stays byte-identical across repeated checks while writes are
   happening on the source, CDC is silently stalled** (dead/expired resume
-  token — see §1). This is the same silent-stall failure the base plan warns
-  about; it produces zero error output.
+  token — see Part Two §T6). This is the same silent-stall failure the base
+  plan warns about; it produces zero error output.
 - **Positive confirmation CDC is genuinely healthy:** run `workflow describe`
   twice, ~30s apart, and compare. `EventsRead`/`EventsWritten` climbing and
   the `Cursor` value changing between the two checks means CDC is actively
   processing live writes — this is the real proof, not just the absence of a
-  frozen cursor. (Validated live: after an unplanned EC2 reboot, `Attempt 2`
-  with `LastFailure: activity Heartbeat timeout` on both `dsync_StreamChanges`
-  and `dsync_StreamLSN` appeared — expected, not a bug, since the whole host
-  went down mid-heartbeat. Both auto-resumed on their own once Docker's
-  `restart: unless-stopped` policy brought the containers back, continuing
-  from their prior `EventsRead`/`EventsWritten` counts rather than restarting
-  from zero.)
+  frozen cursor.
 
 To watch visually instead: SSH-tunnel port 8080 to your laptop and use a real
 browser (the dashboard's JS makes its own internal calls that `curl` can't
@@ -284,9 +285,383 @@ ssh -i <key.pem> -L 8080:localhost:8080 ec2-user@<host> -N
 Temporal's own Web UI at `:8233` works normally over the same kind of tunnel
 or directly if the security group allows it.
 
+For a deeper read on CDC architecture, throughput tuning, and what each
+dashboard column actually measures, see Part Two §T1.
+
 ---
 
-## 4.1 CDC architecture and tuning — lessons learned (validated live on the POC)
+## 6. Scaling workers live
+
+Add workers — new replicas immediately start pulling pending partition tasks,
+no restart of runner/other workers needed:
+```bash
+docker compose up -d --scale worker=<N> worker
+```
+
+Remove a worker permanently (not auto-restarted):
+```bash
+docker compose stop compose-worker-<N>
+```
+
+Simulate a crash (Docker's `restart: unless-stopped` policy auto-restarts it
+within seconds — this tests self-healing, not permanent removal):
+```bash
+docker kill compose-worker-<N>
+```
+
+In-flight partitions on a removed/crashed worker get reassigned to survivors
+automatically once the activity's heartbeat timeout expires (~1 min default) —
+**unless `--pause-on-error` triggers first**, in which case see Part Two §T2.
+
+**Note:** scaling worker *count* only helps during initial sync (parallelizable
+across many doc partitions). It does nothing for change-stream/CDC throughput
+once initial sync is complete — see Part Two §T1 for what actually moves CDC
+throughput and why.
+
+---
+
+## 7. Verification
+
+`verify` runs in `simple` mode (no Temporal) and, by default, **runs
+indefinitely** — it verifies the initial-sync data and then keeps tailing and
+verifying CDC forever unless told otherwise.
+
+**Run this only once initial sync is confirmed complete.** Running `verify`
+while dsync's own initial sync is still copying data produces enormous
+false-positive mismatch counts (validated live: 30-50 million "mismatches"
+during an active copy, decreasing over time as the destination caught up) —
+those aren't real, just a timing artifact of comparing against a
+still-changing destination. Confirm the workflow is in `dsync_StreamChanges`
+(§5) before trusting any verify output.
+
+**Avoid `--report-all` — use `--report-limit` instead.** `--report-all`
+tries to hold/print every mismatch found each report interval; if the run
+happens to catch a large mismatch count (e.g. started too early, per above),
+that's real memory pressure. `--report-limit N` caps it to a bounded,
+representative sample per interval instead (default is `5`, a bit thin —
+`50` gives a better sample without the unbounded-memory risk):
+
+**One-time check before cutover (recommended — exits cleanly when done):**
+```bash
+set -a; source /opt/docdb-migration/compose/.env; set +a
+
+# DSYNCT_MODE=simple is required — without it the image only recognizes the
+# Temporal-mode commands (app/temporal/worker/run), not verify/sync/etc.
+#
+# Flag order matters: verify's own flags (--report-limit, --parallelism,
+# --skip-change-stream, --namespace) must come BEFORE the source/destination
+# URIs. Anything placed after a URI gets parsed as an option for THAT
+# connector instead and fails with "flag provided but not defined".
+docker run --rm --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise \
+  verify \
+  --report-limit 50 --parallelism 8 --skip-change-stream \
+  "$DOCDB_SRC" \
+  "$MDB_DEST"
+```
+
+If memory is still a concern on a very large dataset (verify's Merkle-tree
+comparison loads items from both sides, so it's inherently memory-hungry at
+scale), lower `--parallelism` (fewer concurrent workers held in memory) or
+split the run across `--total-partitions`/`--partition` instead of one full
+pass:
+```bash
+--total-partitions 4 --partition 0   # run this range, then repeat for 1,2,3
+```
+
+Omit `--namespace` for all-databases verification, matching the sync scope.
+
+**Background/continuous run (includes CDC verification, runs forever):**
+```bash
+docker run -d --name docdb-verify --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise \
+  verify \
+  --report-limit 50 --parallelism 8 --report-interval 30s \
+  "$DOCDB_SRC" \
+  "$MDB_DEST"
+```
+This container has **no restart policy** — it will not survive a host
+reboot (see Part Two §T5) and must be re-launched manually if it exits.
+Check on it with `docker logs --tail 50 docdb-verify` / `docker ps -a | grep docdb-verify`.
+
+---
+
+## 8. Create indexes on the destination (once CDC backlog is ~0, before cutover)
+
+Once the change-stream backlog has converged to ~0 (per Part Two §T1's
+"cutover-ready signature" — `Events Read ≈ Events Written`, `Latency: 0`,
+`Last Event` matching wall-clock now), create the destination indexes using
+the `migrateIndexes` utility. It is already staged as part of this toolkit
+(`HELPER_TOOLS` in the bundle) — no separate copy step needed.
+
+Binary and sample config location (installed by
+`install-docdb-migration-toolkit.sh`):
+```
+${PREFIX}/libexec/migrateIndexes                          # e.g. /opt/docdb-migration/libexec/migrateIndexes
+${PREFIX}/configs/migrateIndexes.config.sample.json
+```
+
+**Why now, not earlier:** `create` mode deliberately neutralizes `unique`
+indexes to `unique:false` and TTL indexes to `expireAfterSeconds = MAX_INT`
+when building them on the destination. Building real `unique`/TTL indexes
+while CDC is still actively replaying inserts would risk a uniqueness
+violation on a replayed/duplicate write, or a document expiring before it's
+even been verified. Waiting until the backlog is ~0 (but still before
+cutover/stopping source writes) minimizes that window while still getting
+the index builds — usually the slowest part of a migration — done ahead of
+time instead of adding it to the cutover critical path.
+
+```bash
+cd ${PREFIX}/configs
+cp migrateIndexes.config.sample.json migrateIndexes.config.json
+```
+
+Edit `migrateIndexes.config.json` — reuse the same connection strings as
+`.env`'s `DOCDB_SRC`/`MDB_DEST`:
+```json
+{
+  "source_uri": "mongodb://<user>:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=${PREFIX}/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false",
+  "destination_uri": "mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true",
+  "databases": [],
+  "log_file": "migrateIndexes-create.log"
+}
+```
+`databases: []` auto-discovers every non-system database — leave empty
+unless scoping to specific DBs.
+
+Dry run first — always:
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=true
+```
+Review the printed list of indexes it would create (unique/TTL shown
+neutralized), then apply:
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false --concurrency=8
+```
+(`--concurrency` default 8; raise on a bigger Atlas tier with headroom,
+lower if you see connection-pool/server-selection timeouts. MongoDB
+serializes multiple index builds on the *same* collection regardless of
+this setting — it only parallelizes across different collections.)
+
+Verify (read-only, safe to run anytime):
+```bash
+${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=verify
+```
+At this stage expect `PENDING` on the unique/TTL indexes — that's the
+neutralized state and is correct, not a failure. Exit code `4` (INCOMPLETE)
+is expected right now; a real problem is exit code `3`
+(`MISMATCH`/`MISSING`/`EXTRA`).
+
+**Post-cutover** (after source writes have genuinely stopped and CDC has
+fully drained for real, not just momentarily): run `--mode=rectify` to
+restore real `unique:true` and original TTL values, then `verify` again
+expecting `PASS` (exit code `0`). See §9 for where this fits in the overall
+cutover sequence.
+
+---
+
+## 9. Cutover sequence
+
+A full `verify` pass over a large collection takes hours, not minutes — it
+does not fit inside the actual cutover window. **Start it well before
+cutover is planned** (§7), let it run to completion in the background, and
+only schedule/execute cutover once it has finished with zero mismatches.
+Don't start a fresh `verify` run as part of the cutover steps themselves.
+
+1. Start (or confirm already running) the background `verify` from §7, with
+   enough lead time before the planned cutover for a full pass to complete.
+2. Once both `src` and `dst` show `Tasks=X/X` (fully scanned — see §5/§7 for
+   why partial-pass output isn't trustworthy) and `mismatchCount` has
+   settled at `0`, the data is confirmed consistent. This is your green
+   light to schedule the actual cutover.
+3. Create destination indexes now if not already done (§8) — do this
+   *before* stopping writes, while CDC backlog is ~0, so index builds don't
+   sit on the cutover critical path:
+   ```bash
+   ${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
+   ```
+4. **Stop writes on DocumentDB** (app-level maintenance mode, or block at the
+   security-group level). This is the actual start of the cutover window.
+5. Confirm CDC lag has drained to 0 — check `workflow describe`'s
+   `dsync_StreamChanges` heartbeat repeatedly; `EventsRead` should stop
+   climbing and the cursor should stabilize once no new writes occur (same
+   signature as Part Two §T1's cutover-ready check, but now against a
+   genuinely static source).
+6. **Compare document counts and indexes on both sides** now that the
+   source is frozen — this is the final correctness gate before switching
+   traffic:
+   ```bash
+   # Document counts, every DB/collection, source vs destination
+   DOCDB_SRC="$DOCDB_SRC" MDB_DEST="$MDB_DEST" fullCountVerify.sh
+   # (or, if not symlinked onto PATH: ${PREFIX}/libexec/fullCountVerify.sh)
+
+   # Index parity, including that unique/TTL are still neutralized
+   # (expected PENDING/INCOMPLETE until step 7 below)
+   migrateIndexes --config migrateIndexes.config.json --mode=verify
+   ```
+   `fullCountVerify.sh` (staged as part of this toolkit — reuses the same
+   `$DOCDB_SRC`/`$MDB_DEST` env vars as everything else) walks every
+   non-system database/collection on the source, runs
+   `estimatedDocumentCount()` against the matching collection on the
+   destination, and prints a `PASS`/`FAIL` line per collection plus a
+   summary count. Any `FAIL` here means don't proceed — investigate before
+   cutting over, don't just retry the comparison.
+7. Restore unique indexes and correct TTL settings:
+   ```bash
+   migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
+   ```
+   Then re-run `verify` and expect `PASS` (exit code `0`).
+8. Switch the application's connection string to Atlas.
+9. Cancel/terminate the Temporal workflow once cutover is confirmed stable.
+10. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
+
+---
+
+## 10. Rollback safety net — reverse CDC (Atlas → DocumentDB)
+
+Same toolkit, same topology, opposite direction: after cutover, run a
+**CDC-only** flow that replicates every new write landing on Atlas back to
+DocumentDB, so a rollback decision doesn't lose data written after cutover.
+Since both sides already hold identical data at cutover, this is
+change-stream-only — **no initial bulk copy**.
+
+**Validated live** on the POC run. If the reverse stream misbehaves after
+following these steps, go to Part Two §T7 for the diagnostic checklist —
+several failure modes here look alike but have very different causes.
+
+### 1. Stop the forward topology
+The forward workflow should already be terminated (§9 step 9). Bring the
+whole compose stack down before reconfiguring — `temporal`, `worker`, and
+`runner` all need to restart with the new `.env`/command args:
+```bash
+sudo docker compose down
+```
+This removes containers but preserves the `temporal-data` volume (workflow
+history, including the terminated forward run) — do **not** add `-v`.
+
+### 2. Edit `.env` — swap source/destination, use a NEW queue and workflow ID
+Never reuse the forward run's `QUEUE`/`WORKFLOW_ID`, even though it's
+terminated:
+```bash
+sudo cp .env .env.forward.bak   # keep the forward config for reference
+sudo nano .env
+```
+```bash
+# swap these two — same variable names as the forward config, reversed values
+MDB_DEST=mongodb://docdbadmin:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false
+DOCDB_SRC=mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true
+
+QUEUE=dsync-<name>-reverse
+WORKFLOW_ID=<name>-reverse
+```
+`retryWrites=false` on the DocumentDB URI is still required regardless of
+direction (DocumentDB doesn't support retryable writes) — it's now on the
+*destination* side of this config.
+
+**Note:** always re-derive these values by reading the `.env` file directly
+when running manual `mongosh` checks later — don't trust a shell's already-
+exported `$DOCDB_SRC`/`$MDB_DEST`, which can silently go stale after an edit
+like this (see Part Two §T7 item 4).
+
+### 3. Add `--skip-initial-sync` to the `runner` service's command
+Not parameterized in the generated template by default — add it manually to
+`docker-compose.yml`, in the `run` leg of the chain (before `temporal`):
+```yaml
+  runner:
+    command:
+      - run
+      - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
+      - "--queue-name=${QUEUE:?set QUEUE in .env}"
+      - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+      - --skip-initial-sync   # <-- CDC only, no bulk copy — data is already identical
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --host-port=0.0.0.0:8080
+      - --persist
+```
+
+### 4. Bring the stack back up
+```bash
+sudo docker compose up -d temporal
+sudo docker compose up -d --scale worker=<N> worker
+sudo docker compose up -d runner
+```
+
+### 5. Confirm it started in CDC-only mode, in the right direction
+```bash
+docker compose exec temporal temporal workflow describe --workflow-id <name>-reverse
+```
+**Pending Activities should show only `dsync_StreamChanges` /
+`dsync_StreamLSN` — no `dsync_InitialSync`.** If you see an `InitialSync`
+activity, `--skip-initial-sync` didn't take effect — check the compose file
+edit and re-recreate the `runner`.
+
+### 6. Live-fire sanity check — confirm direction and delivery
+Write to Atlas (now the source) and confirm it lands on DocumentDB (now the
+destination). Use a small test collection (e.g. `coll_cdctest`), not a
+large production one, so the check stays fast:
+```bash
+mongosh "<Atlas URI>" --eval 'db.getSiblingDB("<db>").coll_cdctest.insertOne({reverseMarker: "check1", ts: new Date()})'
+# wait, then poll:
+mongosh "<DocumentDB URI>" --eval 'db.getSiblingDB("<db>").coll_cdctest.findOne({reverseMarker: "check1"})'
+```
+`workflow describe` should show `EventsRead`/`EventsWritten` climb from 0
+and `LastEventTime` update to a real timestamp once the write is processed.
+If the marker doesn't show up after a reasonable wait, or the numbers look
+inconsistent, go to Part Two §T7 for the full diagnostic checklist before
+assuming it's broken — several of these symptoms are misleading.
+
+### When to tear this down
+Once the rollback window has passed and you're confident in the forward
+cutover, terminate this workflow and bring the stack down the same way as
+§9 step 9 — there's no ongoing need for it past the rollback decision point.
+
+---
+
+## Appendix — full command index (copy-paste order for a fresh production run)
+
+```bash
+# --- Pre-flight (source) ---
+mongosh "$DOCDB_SRC" --eval 'printjson(db.getSiblingDB("admin").runCommand({ modifyChangeStreams: 1, database: "", collection: "", enable: true }))'
+aws docdb modify-db-cluster-parameter-group --db-cluster-parameter-group-name <pg> --parameters ParameterName=change_stream_log_retention_duration,ParameterValue=604800,ApplyMethod=immediate
+fixIdTypes --mode detect --config /opt/docdb-migration/configs/fixIdTypes.config.sample.json
+checkChangeStreams
+
+# --- Configure ---
+cd /opt/docdb-migration/compose
+cp .env.sample .env   # edit DOCDB_SRC, MDB_DEST, QUEUE, WORKFLOW_ID
+sed -i '/--namespace=\${NAMESPACE/d' docker-compose.yml   # only if migrating ALL databases
+
+# --- Launch ---
+docker compose up -d temporal
+docker compose up -d --scale worker=3 worker
+docker compose up -d runner
+
+# --- Monitor (repeat throughout) ---
+docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
+
+# --- Create destination indexes (once CDC backlog ~0, BEFORE stopping writes — §8) ---
+migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
+
+# --- Cutover ---
+# (stop source writes externally)
+docker run --rm --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise verify --report-limit 50 --parallelism 8 --skip-change-stream "$DOCDB_SRC" "$MDB_DEST"
+fullCountVerify.sh                                                          # count parity, source vs destination
+migrateIndexes --config migrateIndexes.config.json --mode=verify           # index parity (expect PENDING pre-rectify)
+migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
+migrateIndexes --config migrateIndexes.config.json --mode=verify           # expect PASS now
+# (switch app to Atlas)
+docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> --reason "cutover complete"
+```
+
+---
+
+# PART TWO — Troubleshooting, Tuning & Reference
+
+Nothing in this part is a required step in a normal run — come here when
+Part One doesn't behave as described, you need to tune throughput, or you
+want the full CLI flag reference.
+
+## T1. CDC architecture and tuning — lessons learned (validated live on the POC)
 
 ### A single change stream is pinned to ONE worker container — scaling worker
 ### *count* does not speed up CDC once initial sync is done
@@ -351,7 +726,7 @@ host CPU is not saturated but throughput won't climb, check:
 | `Events Read` − `Events Written` | current backlog. Growing = destination writer falling behind; shrinking/stable = healthy. |
 | `Latency` | gap between an event being read and being written — watch it trend down, not just its absolute value. |
 | `Throughput` | ops/sec **for the current interval only** — 0 ops/sec when caught up simply means no new source writes are landing right now, not that the stream died. |
-| `Last Event` | wall-clock timestamp of the most recently processed source event — compare to `date -u` on the host. Within a few seconds = live and caught up. Stuck/old while source is writing = silently stalled resume token (see §1). |
+| `Last Event` | wall-clock timestamp of the most recently processed source event — compare to `date -u` on the host. Within a few seconds = live and caught up. Stuck/old while source is writing = silently stalled resume token (see §2), OR see §T7 item 3 for another common cause of an apparently-frozen `Last Event`. |
 
 **Cutover-ready signature, observed live:** `Events Read == Events Written`
 (zero backlog), `Latency: 0`, `Throughput: 0 ops/sec` (nothing new to
@@ -388,7 +763,7 @@ while the source is 100% inserts is normal during CDC.
 
 ---
 
-## 5. Handling paused activities
+## T2. Handling paused activities
 
 Worker command includes `--pause-on-error`, and `--attempts-before-pause`
 defaults to `0` — **the first error on any activity pauses it immediately,
@@ -408,16 +783,57 @@ docker compose exec temporal temporal activity unpause \
   --reset-attempts --reset-heartbeats
 ```
 
+Or target a single activity by ID (get the current ID from `activity list`
+above first — don't reuse an ID from an old log line, it may have been
+rescheduled):
+```bash
+docker compose exec temporal temporal activity unpause \
+  --workflow-id <WORKFLOW_ID> --activity-id <ID> \
+  --reset-attempts --reset-heartbeats
+```
+
+### Silent pause via the dsynct web dashboard (`:8080`) — validated live, cost significant debugging time
+
+The dsynct progress dashboard's **Actions** menu on each Change Stream
+Progress row includes a Pause action. Clicking it (even accidentally, or
+from an earlier session) sets `TemporalPauseInfo` on that activity and
+**freezes `Events Read`/`Events Written`/`Last Event` completely** — but the
+workflow still shows `State: Running` in the dashboard summary and produces
+**no error**. `Read Ahead`/`Latency` (driven by the separate `dsync_StreamLSN`
+polling activity) keep climbing normally the whole time, which makes a
+paused `dsync_StreamChanges` activity look deceptively like a slow
+backlog-drain in progress rather than a fully stopped pipeline.
+
+**How to tell the difference:** compare two `workflow describe` snapshots a
+few minutes apart.
+- **Genuinely slow (not paused):** `EventsRead`/`EventsWritten` keep
+  climbing, even slowly.
+- **Silently paused:** `EventsRead`/`EventsWritten` are byte-for-byte
+  identical across snapshots, `LastHeartbeatTime` stops advancing, and
+  `SearchAttributes` in `workflow describe`'s top section shows
+  `TemporalPauseInfo` populated (not `null`) — this is the definitive tell,
+  check it before spending time on oplog-size/OOM/backlog theories:
+  ```bash
+  docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID> \
+    | grep -A2 TemporalPauseInfo
+  ```
+Fix is the same `activity unpause` command above. Also check
+`docker compose logs worker` for a `RecordActivityHeartbeat with error ...
+Error="activity paused"` line — that pinpoints the exact moment and activity
+ID the pause took effect.
+
 ---
 
-## 5.1 Enabling debug logs
+## T3. Enabling debug logs (chained "app" mode)
 
 `worker` and `runner` run in dsynct's **chained "app" mode** (no
 `DSYNCT_MODE=simple`) — this exposes a completely different CLI surface than
-the "simple" mode used for `verify`/`sync`/etc. in §8. In chained mode,
+the "simple" mode used for `verify`/`sync`/etc. in §7. In chained mode,
 `--log-level` is NOT a top-level global flag — it belongs to the `app`
 sub-command specifically, which appears at the *end* of the chain in both
-`worker` and `runner`'s `command:` list.
+`worker` and `runner`'s `command:` list. Applies identically whether you're
+running the forward config or the reverse-CDC config from §10 — same
+mechanism either way.
 
 **Wrong** (fails with `flag provided but not defined: -log-level`):
 ```yaml
@@ -472,6 +888,10 @@ namespace filter regex:
 ```
 DEBUG Change stream namespace filter: {"$and":[{"ns.db":{"$regex":{"$regularExpression":{"pattern":"^(?!local$|config$|admin$|adiom-internal$)","options":""}}}},{"ns.coll":{"$regex":{"$regularExpression":{"pattern":"^(?!system.)","options":""}}}}]}
 ```
+It does **not**, however, surface per-write operation type or a stalled/paused
+state any more clearly than `workflow describe` does — for diagnosing a
+stuck/paused stream, the check in §T2 (`TemporalPauseInfo` +
+`"activity paused"` in the logs) is the one that actually matters.
 
 Docker's own on-disk log file backing `docker compose logs` (useful for `grep`/
 long-term retention regardless of dsynct's own verbosity):
@@ -481,7 +901,7 @@ sudo cat /var/lib/docker/containers/$(docker compose ps -q worker)/*-json.log | 
 
 ---
 
-## 5.2 Full CLI reference — chained "app" mode (`worker` / `runner` / `temporal` / `app`)
+## T4. Full CLI reference — chained "app" mode (`worker` / `runner` / `temporal` / `app`)
 
 This is the mode actually used by the running topology (no `DSYNCT_MODE=simple`).
 Captured live via `docker run --rm dsynct:enterprise <subcommand> --help`.
@@ -557,39 +977,14 @@ USAGE: dsynct temporal [command options]
 
 Note: this chained-mode CLI is distinct from the **"simple" mode**
 (`-e DSYNCT_MODE=simple`) used for one-shot commands like `verify`,
-`sync`, `sample-ids`, `verify-ids`, `connectors` — see §8 for those, and note
+`sync`, `sample-ids`, `verify-ids`, `connectors` — see §7 for those, and note
 that in simple mode `--log-level` IS a genuine top-level global flag (it sits
 alongside `--otel`, `--host-port`, `--pprof-host-port` at the root, not nested
 under `app`).
 
 ---
 
-## 6. Scaling workers live
-
-Add workers — new replicas immediately start pulling pending partition tasks,
-no restart of runner/other workers needed:
-```bash
-docker compose up -d --scale worker=<N> worker
-```
-
-Remove a worker permanently (not auto-restarted):
-```bash
-docker compose stop compose-worker-<N>
-```
-
-Simulate a crash (Docker's `restart: unless-stopped` policy auto-restarts it
-within seconds — this tests self-healing, not permanent removal):
-```bash
-docker kill compose-worker-<N>
-```
-
-In-flight partitions on a removed/crashed worker get reassigned to survivors
-automatically once the activity's heartbeat timeout expires (~1 min default) —
-**unless `--pause-on-error` triggers first**, in which case see §5.
-
----
-
-## 6.1 Recovering from an EC2 host reboot/restart
+## T5. Recovering from an EC2 host reboot/restart
 
 **Validated live** on the POC run — an unplanned host reboot mid-migration
 recovered on its own with no manual steps:
@@ -615,10 +1010,10 @@ If anything *doesn't* come back automatically:
   whether the container's exit was recorded as clean or a failure during
   shutdown. If it's not `Up`, just: `docker compose up -d runner`.
 - Any one-off container started with plain `docker run` (no compose service,
-  no restart policy) — e.g. the `docdb-verify` container from §8 — will
+  no restart policy) — e.g. the `docdb-verify` container from §7 — will
   **not** come back on its own. Re-run it manually.
 - If `temporal` crash-loops post-reboot with the same
-  `SQLITE_CANTOPEN`/permissions error from §3, the volume permission fix
+  `SQLITE_CANTOPEN`/permissions error from §4, the volume permission fix
   should have persisted across the reboot (it's a host filesystem change,
   not container state) — but re-check if it recurs:
   ```bash
@@ -639,7 +1034,7 @@ aws ec2 describe-instances --instance-ids <instance-id> \
 
 ---
 
-## 7. Restarting cleanly (stale/dead CDC token, or any full restart)
+## T6. Restarting cleanly (stale/dead CDC token, or any full restart)
 
 ```bash
 # 1. Terminate the existing workflow (only if still Running; a Completed
@@ -661,316 +1056,7 @@ never creates duplicates, just re-matches/overwrites what's already there.
 
 ---
 
-## 8. Verification
-
-`verify` runs in `simple` mode (no Temporal) and, by default, **runs
-indefinitely** — it verifies the initial-sync data and then keeps tailing and
-verifying CDC forever unless told otherwise.
-
-**Run this only once initial sync is confirmed complete.** Running `verify`
-while dsync's own initial sync is still copying data produces enormous
-false-positive mismatch counts (validated live: 30-50 million "mismatches"
-during an active copy, decreasing over time as the destination caught up) —
-those aren't real, just a timing artifact of comparing against a
-still-changing destination. Confirm the workflow is in `dsync_StreamChanges`
-(§4) before trusting any verify output.
-
-**Avoid `--report-all` — use `--report-limit` instead.** `--report-all`
-tries to hold/print every mismatch found each report interval; if the run
-happens to catch a large mismatch count (e.g. started too early, per above),
-that's real memory pressure. `--report-limit N` caps it to a bounded,
-representative sample per interval instead (default is `5`, a bit thin —
-`50` gives a better sample without the unbounded-memory risk):
-
-**One-time check before cutover (recommended — exits cleanly when done):**
-```bash
-set -a; source /opt/docdb-migration/compose/.env; set +a
-
-# DSYNCT_MODE=simple is required — without it the image only recognizes the
-# Temporal-mode commands (app/temporal/worker/run), not verify/sync/etc.
-#
-# Flag order matters: verify's own flags (--report-limit, --parallelism,
-# --skip-change-stream, --namespace) must come BEFORE the source/destination
-# URIs. Anything placed after a URI gets parsed as an option for THAT
-# connector instead and fails with "flag provided but not defined".
-docker run --rm --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise \
-  verify \
-  --report-limit 50 --parallelism 8 --skip-change-stream \
-  "$DOCDB_SRC" \
-  "$MDB_DEST"
-```
-
-If memory is still a concern on a very large dataset (verify's Merkle-tree
-comparison loads items from both sides, so it's inherently memory-hungry at
-scale), lower `--parallelism` (fewer concurrent workers held in memory) or
-split the run across `--total-partitions`/`--partition` instead of one full
-pass:
-```bash
---total-partitions 4 --partition 0   # run this range, then repeat for 1,2,3
-```
-
-Omit `--namespace` for all-databases verification, matching the sync scope.
-
-**Background/continuous run (includes CDC verification, runs forever):**
-```bash
-docker run -d --name docdb-verify --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise \
-  verify \
-  --report-limit 50 --parallelism 8 --report-interval 30s \
-  "$DOCDB_SRC" \
-  "$MDB_DEST"
-```
-This container has **no restart policy** — it will not survive a host
-reboot (see §6.1) and must be re-launched manually if it exits. Check on it
-with `docker logs --tail 50 docdb-verify` / `docker ps -a | grep docdb-verify`.
-
----
-
-## 8.1 Create indexes on the destination (once CDC backlog is ~0, before cutover)
-
-Once the change-stream backlog has converged to ~0 (per §4.1's "cutover-ready
-signature" — `Events Read ≈ Events Written`, `Latency: 0`, `Last Event`
-matching wall-clock now), create the destination indexes using the
-`migrateIndexes` utility. It is already staged as part of this toolkit
-(`HELPER_TOOLS` in the bundle) — no separate copy step needed.
-
-Binary and sample config location (installed by
-`install-docdb-migration-toolkit.sh`):
-```
-${PREFIX}/libexec/migrateIndexes                          # e.g. /opt/docdb-migration/libexec/migrateIndexes
-${PREFIX}/configs/migrateIndexes.config.sample.json
-```
-
-**Why now, not earlier:** `create` mode deliberately neutralizes `unique`
-indexes to `unique:false` and TTL indexes to `expireAfterSeconds = MAX_INT`
-when building them on the destination. Building real `unique`/TTL indexes
-while CDC is still actively replaying inserts would risk a uniqueness
-violation on a replayed/duplicate write, or a document expiring before it's
-even been verified. Waiting until the backlog is ~0 (but still before
-cutover/stopping source writes) minimizes that window while still getting
-the index builds — usually the slowest part of a migration — done ahead of
-time instead of adding it to the cutover critical path.
-
-```bash
-cd ${PREFIX}/configs
-cp migrateIndexes.config.sample.json migrateIndexes.config.json
-```
-
-Edit `migrateIndexes.config.json` — reuse the same connection strings as
-`.env`'s `DOCDB_SRC`/`MDB_DEST`:
-```json
-{
-  "source_uri": "mongodb://<user>:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=${PREFIX}/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false",
-  "destination_uri": "mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true",
-  "databases": [],
-  "log_file": "migrateIndexes-create.log"
-}
-```
-`databases: []` auto-discovers every non-system database — leave empty
-unless scoping to specific DBs.
-
-Dry run first — always:
-```bash
-${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=true
-```
-Review the printed list of indexes it would create (unique/TTL shown
-neutralized), then apply:
-```bash
-${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false --concurrency=8
-```
-(`--concurrency` default 8; raise on a bigger Atlas tier with headroom,
-lower if you see connection-pool/server-selection timeouts. MongoDB
-serializes multiple index builds on the *same* collection regardless of
-this setting — it only parallelizes across different collections.)
-
-Verify (read-only, safe to run anytime):
-```bash
-${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=verify
-```
-At this stage expect `PENDING` on the unique/TTL indexes — that's the
-neutralized state and is correct, not a failure. Exit code `4` (INCOMPLETE)
-is expected right now; a real problem is exit code `3`
-(`MISMATCH`/`MISSING`/`EXTRA`).
-
-**Post-cutover** (after source writes have genuinely stopped and CDC has
-fully drained for real, not just momentarily): run `--mode=rectify` to
-restore real `unique:true` and original TTL values, then `verify` again
-expecting `PASS` (exit code `0`). See §9 for where this fits in the overall
-cutover sequence.
-
----
-
-## 9. Cutover sequence
-
-A full `verify` pass over a large collection takes hours, not minutes — it
-does not fit inside the actual cutover window. **Start it well before
-cutover is planned** (§8), let it run to completion in the background, and
-only schedule/execute cutover once it has finished with zero mismatches.
-Don't start a fresh `verify` run as part of the cutover steps themselves.
-
-1. Start (or confirm already running) the background `verify` from §8, with
-   enough lead time before the planned cutover for a full pass to complete.
-2. Once both `src` and `dst` show `Tasks=X/X` (fully scanned — see §4/§8 for
-   why partial-pass output isn't trustworthy) and `mismatchCount` has
-   settled at `0`, the data is confirmed consistent. This is your green
-   light to schedule the actual cutover.
-3. Create destination indexes now if not already done (§8.1) — do this
-   *before* stopping writes, while CDC backlog is ~0, so index builds don't
-   sit on the cutover critical path:
-   ```bash
-   ${PREFIX}/libexec/migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
-   ```
-4. **Stop writes on DocumentDB** (app-level maintenance mode, or block at the
-   security-group level). This is the actual start of the cutover window.
-5. Confirm CDC lag has drained to 0 — check `workflow describe`'s
-   `dsync_StreamChanges` heartbeat repeatedly; `EventsRead` should stop
-   climbing and the cursor should stabilize once no new writes occur (same
-   signature as §4.1's cutover-ready check, but now against a genuinely
-   static source).
-6. **Compare document counts and indexes on both sides** now that the
-   source is frozen — this is the final correctness gate before switching
-   traffic:
-   ```bash
-   # Document counts, every DB/collection, source vs destination
-   DOCDB_SRC="$DOCDB_SRC" MDB_DEST="$MDB_DEST" fullCountVerify.sh
-   # (or, if not symlinked onto PATH: ${PREFIX}/libexec/fullCountVerify.sh)
-
-   # Index parity, including that unique/TTL are still neutralized
-   # (expected PENDING/INCOMPLETE until step 7 below)
-   migrateIndexes --config migrateIndexes.config.json --mode=verify
-   ```
-   `fullCountVerify.sh` (staged as part of this toolkit — reuses the same
-   `$DOCDB_SRC`/`$MDB_DEST` env vars as everything else) walks every
-   non-system database/collection on the source, runs
-   `estimatedDocumentCount()` against the matching collection on the
-   destination, and prints a `PASS`/`FAIL` line per collection plus a
-   summary count. Any `FAIL` here means don't proceed — investigate before
-   cutting over, don't just retry the comparison.
-7. Restore unique indexes and correct TTL settings:
-   ```bash
-   migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
-   ```
-   Then re-run `verify` and expect `PASS` (exit code `0`).
-8. Switch the application's connection string to Atlas.
-9. Cancel/terminate the Temporal workflow once cutover is confirmed stable.
-10. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
-
----
-
-## 10. Rollback safety net — reverse CDC (Atlas → DocumentDB)
-
-Same toolkit, same topology, opposite direction: after cutover, run a
-**CDC-only** flow that replicates every new write landing on Atlas back to
-DocumentDB, so a rollback decision doesn't lose data written after cutover.
-Since both sides already hold identical data at cutover, this is
-change-stream-only — **no initial bulk copy**.
-
-**Validated live** on the POC run.
-
-### 1. Stop the forward topology
-The forward workflow should already be terminated (§9 step 9). Bring the
-whole compose stack down before reconfiguring — `temporal`, `worker`, and
-`runner` all need to restart with the new `.env`/command args:
-```bash
-sudo docker compose down
-```
-This removes containers but preserves the `temporal-data` volume (workflow
-history, including the terminated forward run) — do **not** add `-v`.
-
-### 2. Edit `.env` — swap source/destination, use a NEW queue and workflow ID
-Never reuse the forward run's `QUEUE`/`WORKFLOW_ID`, even though it's
-terminated:
-```bash
-sudo cp .env .env.forward.bak   # keep the forward config for reference
-sudo nano .env
-```
-```bash
-# swap these two — same variable names as the forward config, reversed values
-MDB_DEST=mongodb://docdbadmin:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false
-DOCDB_SRC=mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true
-
-QUEUE=dsync-<name>-reverse
-WORKFLOW_ID=<name>-reverse
-```
-`retryWrites=false` on the DocumentDB URI is still required regardless of
-direction (DocumentDB doesn't support retryable writes) — it's now on the
-*destination* side of this config.
-
-### 3. Add `--skip-initial-sync` to the `runner` service's command
-Not parameterized in the generated template by default — add it manually to
-`docker-compose.yml`, in the `run` leg of the chain (before `temporal`):
-```yaml
-  runner:
-    command:
-      - run
-      - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
-      - "--queue-name=${QUEUE:?set QUEUE in .env}"
-      - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
-      - --skip-initial-sync   # <-- CDC only, no bulk copy — data is already identical
-      - temporal
-      - --host-port=temporal:7233
-      - app
-      - --host-port=0.0.0.0:8080
-      - --persist
-```
-
-### 4. Bring the stack back up
-```bash
-sudo docker compose up -d temporal
-sudo docker compose up -d --scale worker=<N> worker
-sudo docker compose up -d runner
-```
-
-### 5. Confirm it started in CDC-only mode, in the right direction
-```bash
-docker compose exec temporal temporal workflow describe --workflow-id <name>-reverse
-```
-**Pending Activities should show only `dsync_StreamChanges` /
-`dsync_StreamLSN` — no `dsync_InitialSync`.** If you see an `InitialSync`
-activity, `--skip-initial-sync` didn't take effect — check the compose file
-edit and re-recreate the `runner`.
-
-### 6. Live-fire sanity check — confirm direction and delivery
-Write to Atlas (now the source) and confirm it lands on DocumentDB (now the
-destination):
-```bash
-mongosh "$MDB_DEST_ATLAS_URI" --eval 'db.getSiblingDB("<db>").<coll>.insertOne({reverseTest: true, ts: new Date()})'
-# wait a few seconds, then:
-mongosh "$DOCDB_URI" --eval 'db.getSiblingDB("<db>").<coll>.findOne({reverseTest: true})'
-```
-`workflow describe` should show `EventsRead`/`EventsWritten` climb from 0
-and `LastEventTime` update to a real timestamp once the write is processed —
-same read as §4.1's Change Stream Progress table, just mirrored.
-
-### Enabling debug logs on the reverse `worker`/`runner`
-Same mechanism as the forward config — see §5.1. `--log-level` goes on the
-`app` leg of the command chain, after `temporal`, not as a top-level flag:
-```yaml
-  worker:
-    command:
-      ...
-      - temporal
-      - --host-port=temporal:7233
-      - app
-      - --log-level=DEBUG   # <-- here
-      - --no-progress
-```
-Applies identically to `runner`. Recreate with
-`sudo docker compose up -d --force-recreate worker runner` to pick it up.
-Per §10.1 item 3's own testing, DEBUG-level worker logs do NOT surface
-per-write operation type or a stalled/paused state any more clearly than
-`workflow describe` does — the pause diagnostic in §10.1 item 1
-(`TemporalPauseInfo` + grepping for `"activity paused"` in the logs) is the
-one that actually matters; DEBUG mainly adds the change-stream namespace
-filter line, same as forward.
-
-### When to tear this down
-Once the rollback window has passed and you're confident in the forward
-cutover, terminate this workflow and bring the stack down the same way as
-§9 step 9 — there's no ongoing need for it past the rollback decision point.
-
----
-
-## 10.1 Reverse CDC — known issues and diagnostic checklist (validated live)
+## T7. Reverse CDC (§10) — known issues and diagnostic checklist (validated live)
 
 Debugging a stalled/misbehaving reverse stream is easy to get wrong because
 several symptoms look identical on the dashboard but have completely
@@ -1003,7 +1089,7 @@ moment and activity it happened to:
 ```bash
 docker compose logs worker | grep "activity paused"
 ```
-Fix — unpause and let it resume from where it left off:
+Fix — unpause and let it resume from where it left off (same command as §T2):
 ```bash
 docker compose exec temporal temporal activity unpause \
   --workflow-id <WORKFLOW_ID> --activity-id <ID> \
@@ -1012,7 +1098,7 @@ docker compose exec temporal temporal activity unpause \
 
 ### 2. Fresh workflow restarts can still hit CappedPositionLost/ChangeStreamHistoryLost repeatedly
 
-Not just a stale-token problem (§7) — if the source's oplog contains a very
+Not just a stale-token problem (§T6) — if the source's oplog contains a very
 large *recent* volume (e.g., right after a heavy bulk-load burst), even a
 **brand-new** workflow run can fail immediately on `dsync_StreamLSN`/
 `dsync_StreamChanges` with the same errors, because the position it tries
@@ -1027,9 +1113,9 @@ or exhausting into a paused state.
   more than one restart attempt before it lands on a resume position that
   survives long enough to establish a stable stream.
 - If this recurs repeatedly, increase the source's oplog size/window
-  (Atlas UI → Cluster → Configuration → Additional Settings) — see §"how to
-  make it more faster" discussion; a bigger oplog gives more slack before a
-  slow-to-establish stream's starting position gets evicted.
+  (Atlas UI → Cluster → Configuration → Additional Settings) — a bigger
+  oplog gives more slack before a slow-to-establish stream's starting
+  position gets evicted.
 
 ### 3. Understand what each Change Stream Progress column actually measures — don't extrapolate the wrong one
 
@@ -1043,17 +1129,6 @@ Confirmed against Adiom's own docs (`dsynct.read_ahead_gauge`,
 | `Throughput` | An instantaneous rate at one heartbeat/dashboard poll, not a cumulative average. | Can legitimately read `0` for one snapshot even on a healthy, actively-writing stream. Never conclude "stalled" from a single `0` reading — diff `EventsWritten` across two checks first. |
 | `Last Event` | Timestamp of the *specific event currently being processed* — not wall-clock now. | Can appear **frozen for a long time** (observed: stuck within the same ~4-second window for over an hour, while `EventsWritten` climbed past a million) if the source has an extremely dense cluster of same-timestamp events, typical after a high-concurrency bulk-load burst. Not stuck — that one burst is just enormous. Use `Read Ahead`'s growth *rate* slowing/plateauing as the "approaching real-time" signal instead. |
 | `TemporalPauseInfo` (in `workflow describe`'s `SearchAttributes`, not the dashboard table) | Whether the activity has been paused via the dashboard's Actions menu or CLI. | **Check this first, before any of the above** — see item 1. `null`/empty = not paused. |
-
-- **`Last Event`** = the timestamp of the specific event currently being
-  processed, not wall-clock now. It can appear **frozen for a very long
-  time** (observed: stuck within the same ~4-second window for over an
-  hour of real time, while `EventsWritten` climbed past a million) if the
-  source has an extremely dense cluster of events sharing nearly identical
-  oplog timestamps — typical after a high-concurrency bulk-load burst
-  (many parallel writers, batched inserts). This is not stuck; it just
-  means that one burst is enormous and hasn't finished draining yet. Use
-  `Read Ahead`'s growth *rate* slowing down/plateauing as the signal that
-  the source is being approached, not `Last Event` moving.
 
 ### 4. Don't trust `opcounters`/shell env vars without re-verifying the connection
 
@@ -1075,41 +1150,4 @@ watch -n 15 'mongosh "<dest URI>" --quiet --eval "db.getSiblingDB(\"<db>\").<sma
 ```
 Use a small test collection (e.g. `coll_cdctest`), not a multi-hundred-
 million-document production collection, so the poll query itself stays fast.
-
----
-
-## Appendix — full command index (copy-paste order for a fresh production run)
-
-```bash
-# --- Pre-flight (source) ---
-mongosh "$DOCDB_SRC" --eval 'printjson(db.getSiblingDB("admin").runCommand({ modifyChangeStreams: 1, database: "", collection: "", enable: true }))'
-aws docdb modify-db-cluster-parameter-group --db-cluster-parameter-group-name <pg> --parameters ParameterName=change_stream_log_retention_duration,ParameterValue=604800,ApplyMethod=immediate
-fixIdTypes --mode detect --config /opt/docdb-migration/configs/fixIdTypes.config.sample.json
-checkChangeStreams
-
-# --- Configure ---
-cd /opt/docdb-migration/compose
-cp .env.sample .env   # edit DOCDB_SRC, MDB_DEST, QUEUE, WORKFLOW_ID
-sed -i '/--namespace=\${NAMESPACE/d' docker-compose.yml   # only if migrating ALL databases
-
-# --- Launch ---
-docker compose up -d temporal
-docker compose up -d --scale worker=3 worker
-docker compose up -d runner
-
-# --- Monitor (repeat throughout) ---
-docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
-
-# --- Create destination indexes (once CDC backlog ~0, BEFORE stopping writes — §8.1) ---
-migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
-
-# --- Cutover ---
-# (stop source writes externally)
-docker run --rm --network compose_default -e DSYNCT_MODE=simple dsynct:enterprise verify --report-limit 50 --parallelism 8 --skip-change-stream "$DOCDB_SRC" "$MDB_DEST"
-fullCountVerify.sh                                                          # count parity, source vs destination
-migrateIndexes --config migrateIndexes.config.json --mode=verify           # index parity (expect PENDING pre-rectify)
-migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
-migrateIndexes --config migrateIndexes.config.json --mode=verify           # expect PASS now
-# (switch app to Atlas)
-docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> --reason "cutover complete"
-```
+</content>
