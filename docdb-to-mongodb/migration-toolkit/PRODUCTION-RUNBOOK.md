@@ -856,6 +856,228 @@ Don't start a fresh `verify` run as part of the cutover steps themselves.
 
 ---
 
+## 10. Rollback safety net — reverse CDC (Atlas → DocumentDB)
+
+Same toolkit, same topology, opposite direction: after cutover, run a
+**CDC-only** flow that replicates every new write landing on Atlas back to
+DocumentDB, so a rollback decision doesn't lose data written after cutover.
+Since both sides already hold identical data at cutover, this is
+change-stream-only — **no initial bulk copy**.
+
+**Validated live** on the POC run.
+
+### 1. Stop the forward topology
+The forward workflow should already be terminated (§9 step 9). Bring the
+whole compose stack down before reconfiguring — `temporal`, `worker`, and
+`runner` all need to restart with the new `.env`/command args:
+```bash
+sudo docker compose down
+```
+This removes containers but preserves the `temporal-data` volume (workflow
+history, including the terminated forward run) — do **not** add `-v`.
+
+### 2. Edit `.env` — swap source/destination, use a NEW queue and workflow ID
+Never reuse the forward run's `QUEUE`/`WORKFLOW_ID`, even though it's
+terminated:
+```bash
+sudo cp .env .env.forward.bak   # keep the forward config for reference
+sudo nano .env
+```
+```bash
+# swap these two — same variable names as the forward config, reversed values
+MDB_DEST=mongodb://docdbadmin:<password>@<docdb-cluster-endpoint>:27017/?tls=true&tlsCAFile=/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false
+DOCDB_SRC=mongodb+srv://<user>:<password>@<atlas-cluster>.mongodb.net/?retryWrites=true
+
+QUEUE=dsync-<name>-reverse
+WORKFLOW_ID=<name>-reverse
+```
+`retryWrites=false` on the DocumentDB URI is still required regardless of
+direction (DocumentDB doesn't support retryable writes) — it's now on the
+*destination* side of this config.
+
+### 3. Add `--skip-initial-sync` to the `runner` service's command
+Not parameterized in the generated template by default — add it manually to
+`docker-compose.yml`, in the `run` leg of the chain (before `temporal`):
+```yaml
+  runner:
+    command:
+      - run
+      - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
+      - "--queue-name=${QUEUE:?set QUEUE in .env}"
+      - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+      - --skip-initial-sync   # <-- CDC only, no bulk copy — data is already identical
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --host-port=0.0.0.0:8080
+      - --persist
+```
+
+### 4. Bring the stack back up
+```bash
+sudo docker compose up -d temporal
+sudo docker compose up -d --scale worker=<N> worker
+sudo docker compose up -d runner
+```
+
+### 5. Confirm it started in CDC-only mode, in the right direction
+```bash
+docker compose exec temporal temporal workflow describe --workflow-id <name>-reverse
+```
+**Pending Activities should show only `dsync_StreamChanges` /
+`dsync_StreamLSN` — no `dsync_InitialSync`.** If you see an `InitialSync`
+activity, `--skip-initial-sync` didn't take effect — check the compose file
+edit and re-recreate the `runner`.
+
+### 6. Live-fire sanity check — confirm direction and delivery
+Write to Atlas (now the source) and confirm it lands on DocumentDB (now the
+destination):
+```bash
+mongosh "$MDB_DEST_ATLAS_URI" --eval 'db.getSiblingDB("<db>").<coll>.insertOne({reverseTest: true, ts: new Date()})'
+# wait a few seconds, then:
+mongosh "$DOCDB_URI" --eval 'db.getSiblingDB("<db>").<coll>.findOne({reverseTest: true})'
+```
+`workflow describe` should show `EventsRead`/`EventsWritten` climb from 0
+and `LastEventTime` update to a real timestamp once the write is processed —
+same read as §4.1's Change Stream Progress table, just mirrored.
+
+### Enabling debug logs on the reverse `worker`/`runner`
+Same mechanism as the forward config — see §5.1. `--log-level` goes on the
+`app` leg of the command chain, after `temporal`, not as a top-level flag:
+```yaml
+  worker:
+    command:
+      ...
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --log-level=DEBUG   # <-- here
+      - --no-progress
+```
+Applies identically to `runner`. Recreate with
+`sudo docker compose up -d --force-recreate worker runner` to pick it up.
+Per §10.1 item 3's own testing, DEBUG-level worker logs do NOT surface
+per-write operation type or a stalled/paused state any more clearly than
+`workflow describe` does — the pause diagnostic in §10.1 item 1
+(`TemporalPauseInfo` + grepping for `"activity paused"` in the logs) is the
+one that actually matters; DEBUG mainly adds the change-stream namespace
+filter line, same as forward.
+
+### When to tear this down
+Once the rollback window has passed and you're confident in the forward
+cutover, terminate this workflow and bring the stack down the same way as
+§9 step 9 — there's no ongoing need for it past the rollback decision point.
+
+---
+
+## 10.1 Reverse CDC — known issues and diagnostic checklist (validated live)
+
+Debugging a stalled/misbehaving reverse stream is easy to get wrong because
+several symptoms look identical on the dashboard but have completely
+different causes and fixes. **Check these in this order** — the first one is
+by far the most common and cheapest to rule out.
+
+### 1. Check for a silent pause FIRST, before any backlog/OOM/oplog theory
+
+The dsynct web dashboard's **Actions** menu on each Change Stream Progress
+row includes a Pause action. Clicking it (even accidentally, from an
+earlier session, or muscle memory from clearing a *different* paused
+activity) sets `TemporalPauseInfo` on that activity and **freezes `Events
+Read`/`Events Written`/`Last Event` completely** — but the workflow still
+shows `State: Running` in the dashboard summary and produces **no error**.
+Meanwhile `Read Ahead`/`Latency` (driven by the separate `dsync_StreamLSN`
+polling activity, which keeps running independently) continue climbing
+normally the whole time. This makes a fully-stopped `dsync_StreamChanges`
+activity look exactly like a slow-but-alive backlog drain — the two are
+easy to confuse and this one cost significant debugging time chasing
+oplog-size/OOM theories before the real cause (a stale pause) was found.
+
+**The definitive check:**
+```bash
+docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID> \
+  | grep -A2 TemporalPauseInfo
+```
+If it shows a populated value (not `null`/empty) instead of
+`data:"null"`, the activity is paused. Also grep worker logs for the exact
+moment and activity it happened to:
+```bash
+docker compose logs worker | grep "activity paused"
+```
+Fix — unpause and let it resume from where it left off:
+```bash
+docker compose exec temporal temporal activity unpause \
+  --workflow-id <WORKFLOW_ID> --activity-id <ID> \
+  --reset-attempts --reset-heartbeats
+```
+
+### 2. Fresh workflow restarts can still hit CappedPositionLost/ChangeStreamHistoryLost repeatedly
+
+Not just a stale-token problem (§7) — if the source's oplog contains a very
+large *recent* volume (e.g., right after a heavy bulk-load burst), even a
+**brand-new** workflow run can fail immediately on `dsync_StreamLSN`/
+`dsync_StreamChanges` with the same errors, because the position it tries
+to resume from is already being evicted from the capped oplog by the sheer
+turnover rate. Symptom in worker logs: repeated `Resuming from heartbeat
+details` → `Failed to open change stream: (ChangeStreamHistoryLost)...`
+across many attempts, sometimes 10-30+ in a row, before either succeeding
+or exhausting into a paused state.
+- **Fix that worked live:** terminate and restart (`docker compose exec
+  temporal temporal workflow terminate ...` then
+  `sudo docker compose up -d --force-recreate runner`). It sometimes takes
+  more than one restart attempt before it lands on a resume position that
+  survives long enough to establish a stable stream.
+- If this recurs repeatedly, increase the source's oplog size/window
+  (Atlas UI → Cluster → Configuration → Additional Settings) — see §"how to
+  make it more faster" discussion; a bigger oplog gives more slack before a
+  slow-to-establish stream's starting position gets evicted.
+
+### 3. Understand what each Change Stream Progress column actually measures — don't extrapolate the wrong one
+
+Confirmed against Adiom's own docs (`dsynct.read_ahead_gauge`,
+`dsynct.last_event_time`, `dsynct.written`):
+
+| Column | What it actually means | How to (mis)read it |
+|---|---|---|
+| `Read Ahead` | The **source's own current LSN** (log position), reported by a separate `dsync_StreamLSN` polling activity. Not a cumulative "events scanned" counter, and independent of whether the reader/writer is stuck, alive, or paused. | A climbing `Read Ahead` alone proves NOTHING about whether data is actually being written — don't use it to conclude the pipeline is healthy. |
+| `Events Read` / `Events Written` | The real, trustworthy progress counters. | **This is the one to trust.** Compare across two `workflow describe` snapshots a few minutes apart — both climbing = genuinely alive, regardless of what any other column shows. |
+| `Throughput` | An instantaneous rate at one heartbeat/dashboard poll, not a cumulative average. | Can legitimately read `0` for one snapshot even on a healthy, actively-writing stream. Never conclude "stalled" from a single `0` reading — diff `EventsWritten` across two checks first. |
+| `Last Event` | Timestamp of the *specific event currently being processed* — not wall-clock now. | Can appear **frozen for a long time** (observed: stuck within the same ~4-second window for over an hour, while `EventsWritten` climbed past a million) if the source has an extremely dense cluster of same-timestamp events, typical after a high-concurrency bulk-load burst. Not stuck — that one burst is just enormous. Use `Read Ahead`'s growth *rate* slowing/plateauing as the "approaching real-time" signal instead. |
+| `TemporalPauseInfo` (in `workflow describe`'s `SearchAttributes`, not the dashboard table) | Whether the activity has been paused via the dashboard's Actions menu or CLI. | **Check this first, before any of the above** — see item 1. `null`/empty = not paused. |
+
+- **`Last Event`** = the timestamp of the specific event currently being
+  processed, not wall-clock now. It can appear **frozen for a very long
+  time** (observed: stuck within the same ~4-second window for over an
+  hour of real time, while `EventsWritten` climbed past a million) if the
+  source has an extremely dense cluster of events sharing nearly identical
+  oplog timestamps — typical after a high-concurrency bulk-load burst
+  (many parallel writers, batched inserts). This is not stuck; it just
+  means that one burst is enormous and hasn't finished draining yet. Use
+  `Read Ahead`'s growth *rate* slowing down/plateauing as the signal that
+  the source is being approached, not `Last Event` moving.
+
+### 4. Don't trust `opcounters`/shell env vars without re-verifying the connection
+
+`db.serverStatus().opcounters` compared across two `mongosh` calls that
+*look* like they hit the same cluster can report wildly different absolute
+numbers if the two commands actually connected to different clusters
+(stale/incorrectly-exported `$DOCDB_SRC`/`$MDB_DEST` in the shell,
+unrelated to what's actually in `.env` — see §10 step 2's note on always
+re-deriving from the file). **The decisive, unambiguous test is a
+tag-and-poll**, not opcounters:
+```bash
+# 1. Insert a uniquely tagged marker into the SOURCE (paste the literal
+#    connection string, don't rely on a shell variable you haven't just
+#    re-verified against the .env file)
+mongosh "<source URI>" --eval 'db.getSiblingDB("<db>").<small-coll>.insertOne({reverseMarker: "check1", ts: new Date()})'
+
+# 2. Poll the DESTINATION directly for it
+watch -n 15 'mongosh "<dest URI>" --quiet --eval "db.getSiblingDB(\"<db>\").<small-coll>.findOne({reverseMarker: \"check1\"})"'
+```
+Use a small test collection (e.g. `coll_cdctest`), not a multi-hundred-
+million-document production collection, so the poll query itself stays fast.
+
+---
+
 ## Appendix — full command index (copy-paste order for a fresh production run)
 
 ```bash
