@@ -389,6 +389,178 @@ Check on it with `docker logs --tail 50 docdb-verify` / `docker ps -a | grep doc
 
 ---
 
+## 7.5. Create empty collections on the destination (before indexes)
+
+**dsync does not copy empty collections.** A collection that exists on the
+source with zero documents is never created on the destination — there are no
+documents to drive the copy, and no change-stream events to drive CDC. It
+simply does not appear on Atlas.
+
+This matters beyond cosmetics:
+
+- `migrateIndexes` (§8) has nothing to build indexes *on*, so indexes for
+  those namespaces are silently absent.
+- Application code that assumes a collection exists (or that relies on a
+  unique index existing before its first insert) breaks after cutover.
+- Count verification (§9) reports the namespace as missing rather than as
+  matching-at-zero, adding noise to the cutover checklist.
+
+Run this **after the initial copy has converged** (§5 shows the backlog at
+~0) and **before** creating indexes in §8, so `migrateIndexes` sees every
+namespace.
+
+### 7.5.1 Stage the script
+
+This uses the host-installed `mongosh` and the host-path CA, not the
+containers. Export the host-style URIs as in §3 — note these use
+`${PREFIX}/certs/global-bundle.pem`, the **host** path, not the container's
+`/certs/global-bundle.pem`:
+
+```bash
+export DOCDB_SRC="mongodb://<user>:<password>@<cluster>.cluster-<id>.<region>.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=${PREFIX}/certs/global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+export MDB_DEST="mongodb+srv://<user>:<password>@<cluster>.xxxxx.mongodb.net/?retryWrites=true"
+```
+
+> If you are running the Docker topology from the same shell, `unset
+> DOCDB_SRC MDB_DEST` again afterwards — exported shell variables override
+> `.env` in `docker compose`, and these host paths will crash-loop the
+> workers.
+
+```bash
+cat > ${PREFIX}/scripts/create-empty-collections.js <<'JS'
+// Creates, on the destination, every non-system collection that exists on the
+// source but is missing on the destination. dsync skips empty collections, so
+// this is what puts them on Atlas before index creation.
+//
+// Connect this script to the SOURCE; it opens the destination itself.
+//   DB_FILTER  optional comma-separated allow-list of databases
+//   APPLY      "true" to create; anything else is a dry run
+const DEST_URI = process.env.MDB_DEST;
+if (!DEST_URI) { print("ERROR: MDB_DEST is not set"); quit(1); }
+
+const APPLY     = process.env.APPLY === "true";
+const DB_FILTER = (process.env.DB_FILTER || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const SKIP_DBS  = ["admin", "local", "config"];
+
+const dest = new Mongo(DEST_URI);
+let created = 0, present = 0, skipped = 0, failed = 0;
+
+const dbNames = db.getSiblingDB("admin")
+  .runCommand({ listDatabases: 1, nameOnly: true }).databases
+  .map(d => d.name)
+  .filter(n => !SKIP_DBS.includes(n))
+  .filter(n => DB_FILTER.length === 0 || DB_FILTER.includes(n));
+
+print(`mode: ${APPLY ? "APPLY" : "DRY RUN"}   databases: ${dbNames.join(", ") || "(none)"}`);
+print("");
+
+for (const dbName of dbNames) {
+  const src = db.getSiblingDB(dbName);
+  const dst = dest.getDB(dbName);
+  const onDest = new Set(dst.getCollectionNames());
+
+  for (const c of src.runCommand({ listCollections: 1 }).cursor.firstBatch) {
+    const ns = `${dbName}.${c.name}`;
+
+    // system.* is server-managed; views are derived objects that must be
+    // recreated only after their backing collections exist and are populated.
+    if (c.name.startsWith("system.")) { skipped++; continue; }
+    if (c.type === "view") { print(`[skip-view] ${ns}`); skipped++; continue; }
+
+    if (onDest.has(c.name)) { present++; continue; }
+
+    // Carry over creation-time options that cannot be set after the fact.
+    const opts = {};
+    const o = c.options || {};
+    if (o.capped) { opts.capped = true; opts.size = o.size; if (o.max) opts.max = o.max; }
+    if (o.collation) opts.collation = o.collation;
+    if (o.validator) { opts.validator = o.validator;
+                       if (o.validationLevel)  opts.validationLevel  = o.validationLevel;
+                       if (o.validationAction) opts.validationAction = o.validationAction; }
+
+    const n = src.getCollection(c.name).estimatedDocumentCount();
+    const detail = `${n} doc(s) on source${Object.keys(opts).length ? " opts=" + JSON.stringify(opts) : ""}`;
+
+    if (!APPLY) { print(`[would-create] ${ns}  (${detail})`); created++; continue; }
+
+    try {
+      dst.createCollection(c.name, opts);
+      print(`[created] ${ns}  (${detail})`);
+      created++;
+    } catch (e) {
+      // NamespaceExists (48) means dsync created it between our list and now.
+      if (e.code === 48) { present++; }
+      else { print(`[FAILED]  ${ns}: ${e.message}`); failed++; }
+    }
+  }
+}
+
+print("");
+print(`${APPLY ? "created" : "would create"}: ${created}   already present: ${present}   skipped: ${skipped}   failed: ${failed}`);
+if (failed > 0) quit(1);
+JS
+```
+
+### 7.5.2 Dry run first
+
+```bash
+mkdir -p ${PREFIX}/scripts
+mongosh "$DOCDB_SRC" --quiet --file ${PREFIX}/scripts/create-empty-collections.js
+```
+
+Review the `[would-create]` list. Every entry should show `0 doc(s) on
+source` — a non-zero count there means dsync has **not** finished copying
+that namespace, and you should go back to §5 rather than pre-creating it.
+
+Scope to specific databases if the source hosts more than the migration
+covers (match the `NAMESPACE` / config scope from §3):
+
+```bash
+DB_FILTER=svoc-db mongosh "$DOCDB_SRC" --quiet --file ${PREFIX}/scripts/create-empty-collections.js
+```
+
+### 7.5.3 Apply
+
+```bash
+APPLY=true mongosh "$DOCDB_SRC" --quiet \
+  --file ${PREFIX}/scripts/create-empty-collections.js \
+  | tee ${PREFIX}/logs/create-empty-collections.log
+```
+
+Expect `failed: 0`. The script is idempotent — re-running it after CDC has
+delivered more collections is safe and creates only what is still missing.
+
+### 7.5.4 Confirm namespace parity
+
+```bash
+for URI in "$DOCDB_SRC" "$MDB_DEST"; do
+  mongosh "$URI" --quiet --eval '
+    db.getSiblingDB("admin").runCommand({listDatabases:1,nameOnly:true}).databases
+      .map(d => d.name)
+      .filter(n => !["admin","local","config"].includes(n))
+      .forEach(n => db.getSiblingDB(n).getCollectionNames()
+        .filter(c => !c.startsWith("system."))
+        .forEach(c => print(n + "." + c)));' | sort
+done > /tmp/ns-both.txt
+```
+
+Run the two halves separately and `diff` them; the only acceptable
+difference is views, which §9 recreates after cutover.
+
+**Caveats**
+
+- **Views are not created here.** They depend on their source collections
+  being present and populated; recreate them at cutover (§9) with
+  `db.createView(name, viewOn, pipeline)` using the `options` recorded by
+  `listCollections` on the source.
+- **Time-series collections** are not a DocumentDB concept and will not
+  appear; nothing to do.
+- Creating a collection on Atlas creates its `_id_` index automatically.
+  §8's `migrateIndexes` will then add the remaining indexes as normal.
+
+---
+
 ## 8. Create indexes on the destination (once CDC backlog is ~0, before cutover)
 
 Once the change-stream backlog has converged to ~0 (per Part Two §T1's
@@ -650,6 +822,10 @@ docker compose up -d runner
 
 # --- Monitor (repeat throughout) ---
 docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
+
+# --- Create empty collections dsync skipped (BEFORE indexes — §7.5) ---
+mongosh "$DOCDB_SRC" --quiet --file ${PREFIX}/scripts/create-empty-collections.js            # dry run
+APPLY=true mongosh "$DOCDB_SRC" --quiet --file ${PREFIX}/scripts/create-empty-collections.js
 
 # --- Create destination indexes (once CDC backlog ~0, BEFORE stopping writes — §8) ---
 migrateIndexes --config migrateIndexes.config.json --mode=create --dry-run=false
