@@ -569,6 +569,10 @@ Once the change-stream backlog has converged to ~0 (per Part Two §T1's
 the `migrateIndexes` utility. It is already staged as part of this toolkit
 (`HELPER_TOOLS` in the bundle) — no separate copy step needed.
 
+> **Prerequisite: complete §7.5 first.** `migrateIndexes` only builds indexes
+> on namespaces that exist on the destination. Any collection dsync skipped
+> for being empty would otherwise be left without its indexes.
+
 Binary and sample config location (installed by
 `install-docdb-migration-toolkit.sh`):
 ```
@@ -686,27 +690,59 @@ Don't start a fresh `verify` run as part of the cutover steps themselves.
    migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
    ```
    Then re-run `verify` and expect `PASS` (exit code `0`).
-8. Switch the application's connection string to Atlas.
-9. Cancel/terminate the Temporal workflow once cutover is confirmed stable.
-10. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
+8. **Terminate the forward workflow and bring the stack down.** The source is
+   already frozen (step 4) and CDC has drained (step 5), so there is nothing
+   left for it to carry — and the reverse flow in the next step cannot start
+   while the forward one holds the topology:
+   ```bash
+   docker compose exec temporal temporal workflow terminate \
+     --workflow-id "$WORKFLOW_ID" --reason "cutover complete"
+   docker compose down          # no -v — preserve the temporal-data volume
+   ```
+9. **Start reverse CDC (Atlas → DocumentDB) — before the application writes
+   to Atlas.** This is the rollback safety net, and it only protects writes
+   that land *after* it is streaming. Bring it up while Atlas is still
+   read-only from the application's point of view; anything written to Atlas
+   before the reverse stream is confirmed running is **not** recoverable to
+   DocumentDB by a rollback.
+
+   Follow **§10** in full (swap `.env`, new `QUEUE`/`WORKFLOW_ID`,
+   `--skip-initial-sync` on the `runner`, bring the stack up). Do not proceed
+   to step 10 until §10's post-start check shows the reverse workflow running
+   and its change-stream heartbeat advancing. If it misbehaves, Part Two §T7
+   is the diagnostic checklist — resolve it there rather than cutting traffic
+   over without a net.
+10. Switch the application's connection string to Atlas. Writes now land on
+    Atlas and replicate back to DocumentDB via the reverse flow.
+11. Re-enable Atlas backups (disabled during migration per the target-prep checklist).
+12. Keep the reverse flow running for the agreed rollback window. Only tear
+    it down (`docker compose down`) once you have accepted the migration and
+    given up the ability to roll back.
 
 ---
 
 ## 10. Rollback safety net — reverse CDC (Atlas → DocumentDB)
 
-Same toolkit, same topology, opposite direction: after cutover, run a
-**CDC-only** flow that replicates every new write landing on Atlas back to
-DocumentDB, so a rollback decision doesn't lose data written after cutover.
-Since both sides already hold identical data at cutover, this is
-change-stream-only — **no initial bulk copy**.
+Same toolkit, same topology, opposite direction: a **CDC-only** flow that
+replicates every new write landing on Atlas back to DocumentDB, so a rollback
+decision doesn't lose data written after cutover. Since both sides already
+hold identical data at cutover, this is change-stream-only — **no initial
+bulk copy**.
+
+**This is a cutover step, not a follow-up.** It runs as §9 step 9 — after the
+forward flow is terminated but *before* the application is pointed at Atlas.
+Writes that land on Atlas before this stream is confirmed running are not
+recoverable to DocumentDB by a rollback.
 
 **Validated live** on the POC run. If the reverse stream misbehaves after
 following these steps, go to Part Two §T7 for the diagnostic checklist —
 several failure modes here look alike but have very different causes.
 
 ### 1. Stop the forward topology
-The forward workflow should already be terminated (§9 step 9). Bring the
-whole compose stack down before reconfiguring — `temporal`, `worker`, and
+The forward workflow should already be terminated and the stack brought down
+by §9 step 8 — this section is entered from §9 step 9, *before* application
+writes are switched to Atlas. Bring the whole compose stack down before
+reconfiguring — `temporal`, `worker`, and
 `runner` all need to restart with the new `.env`/command args:
 ```bash
 sudo docker compose down
@@ -837,8 +873,17 @@ fullCountVerify.sh                                                          # co
 migrateIndexes --config migrateIndexes.config.json --mode=verify           # index parity (expect PENDING pre-rectify)
 migrateIndexes --config migrateIndexes.config.json --mode=rectify --dry-run=false
 migrateIndexes --config migrateIndexes.config.json --mode=verify           # expect PASS now
-# (switch app to Atlas)
+
+# --- Stop forward, then start reverse CDC BEFORE app writes (§9 steps 8-9, §10) ---
 docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> --reason "cutover complete"
+docker compose down                                                         # no -v
+# edit .env per §10: swap DOCDB_SRC/MDB_DEST, new QUEUE + WORKFLOW_ID,
+# add --skip-initial-sync to the runner's `run` leg in docker-compose.yml
+docker compose up -d temporal
+docker compose up -d --scale worker=3 worker
+docker compose up -d runner
+docker compose exec temporal temporal workflow describe --workflow-id <name>-reverse   # confirm streaming
+# (only now: switch app to Atlas)
 ```
 
 ---
