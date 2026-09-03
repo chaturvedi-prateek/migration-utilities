@@ -9,6 +9,16 @@ import (
 	"strings"
 )
 
+const mongosyncTimeoutMS = "10800000"
+
+func withMongosyncTimeout(uri string) string {
+	separator := "?"
+	if strings.Contains(uri, "?") {
+		separator = "&"
+	}
+	return uri + separator + "timeoutMS=" + mongosyncTimeoutMS
+}
+
 // jsonIndent marshals with indentation and without HTML escaping, so `&` in
 // connection URIs stays readable in the generated files.
 func jsonIndent(v any) string {
@@ -40,10 +50,11 @@ func genConfigs(cfg *Config, step *Step, out string) error {
 	fmt.Printf("[%s] configs\n", step.Name)
 	for i, j := range step.Jobs {
 		conf := map[string]any{
-			"cluster0":         j.Source,
-			"cluster1":         j.Destination,
+			"cluster0":         withMongosyncTimeout(j.Source),
+			"cluster1":         withMongosyncTimeout(j.Destination),
 			"logPath":          "./logs/" + j.ID,
 			"verbosity":        "INFO",
+			"loadLevel":        3,
 			"port":             cfg.portFor(step, i),
 			"acceptDisclaimer": true,
 			"disableTelemetry": true,
