@@ -1,0 +1,13 @@
+{
+  "source_uri": "mongodb://<account>:<KEY>@<account>.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@<account>@",
+  "destination_uri": "mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority",
+  "databases": [],
+  "log_file": "",
+
+  "ensure_collections": true,
+
+  "ttl_field_map": {
+    "shop.sessions": "lastSeenAt",
+    "shop.events": "createdAt"
+  }
+}

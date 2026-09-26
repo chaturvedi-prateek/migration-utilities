@@ -210,3 +210,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# tool configs contain credentials
+config.json
+**/config.json
+cosmosdb-to-mongodb/**/assessment/

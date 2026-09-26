@@ -1,0 +1,18 @@
+{
+  "source_uri": "mongodb://<account>:<KEY>@<account>.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@<account>@",
+
+  "log_file": "assessCluster.log",
+
+  "databases": [],
+
+  "output_dir": "assessment",
+
+  "concurrency": 4,
+
+  "max_report": 50,
+
+  "waves": {
+    "max_namespaces": 8,
+    "namespaces_file": ""
+  }
+}
