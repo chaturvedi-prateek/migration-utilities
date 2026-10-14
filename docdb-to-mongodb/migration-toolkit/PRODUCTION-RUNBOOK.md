@@ -193,6 +193,34 @@ needs to change — Compose's internal DNS (`temporal:7233`) is unaffected by
 host-side port remaps, since that's a container-to-container connection, not
 going through the host's mapped port at all.
 
+### Large source databases: cap partitions per workflow (`--max-partitions`)
+
+dsync schedules every initial-sync partition as a Temporal activity, all at
+once, inside a single workflow task. On a large database (hundreds of
+millions of documents, or thousands of collections) `DOC_PARTITION=500000`
+produces thousands of partitions, and that workflow task cannot finish
+inside Temporal's default 10s `WorkflowTaskTimeout` — the run stalls in
+planning forever with `Pending Activities = 0`. The shipped compose template
+does not set a cap; add one to the runner's `run` leg in
+`docker-compose.yml` **before the first run** (harmless on small databases —
+it only splits plans above the cap):
+```yaml
+  runner:
+    command:
+      - run
+      - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
+      - "--queue-name=${QUEUE:?set QUEUE in .env}"
+      - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+      - --max-partitions=500        # <-- not in the shipped template; add it
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --host-port=0.0.0.0:8080
+      - --persist
+```
+Part Two §T9 has the failure fingerprint and the recovery procedure if a run
+was already started without it.
+
 ### To migrate ALL databases (not just one)
 
 `dsynct run --namespace` is optional and repeatable — omitting it entirely
@@ -244,6 +272,22 @@ docker compose logs worker --tail=20   # each should show "Started Worker ... Ta
 docker compose logs runner --tail=20   # should show "Started workflow workflow-id=..."
 ```
 
+If a worker logs `context deadline exceeded ... Namespace=default` right at
+start-up, it raced the Temporal server (`depends_on` has no health
+condition). It normally self-recovers; if the line keeps repeating, see
+Part Two §T9-A.
+
+Then, within about a minute, confirm the workflow has actually left the
+planning phase:
+```bash
+docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
+```
+`Pending Activities` should list `dsync_InitialSync` entries. If it stays
+**empty** while `docker compose logs worker` shows `Task processing failed
+... WorkerType=WorkflowWorker Error="context deadline exceeded"` every ~10s,
+the workflow is stuck in a `WorkflowTaskTimedOut` loop — go to Part Two
+§T9-B before touching anything else; it is *not* a connectivity problem.
+
 ---
 
 ## 5. Monitor progress
@@ -262,6 +306,8 @@ docker compose exec temporal temporal workflow show --workflow-id <WORKFLOW_ID> 
 ```
 
 Reading `workflow describe` output:
+- `Pending Activities` **empty** more than a minute after the runner started,
+  and still empty on re-check → the workflow never left planning (Part Two §T9-B)
 - `Pending Activities` of type `dsync_InitialSync` → still copying bulk data
 - `Pending Activities` of type `dsync_StreamChanges` / `dsync_StreamLSN` → in CDC mode
 - `LastHeartbeatDetails` on `dsync_StreamChanges` shows `EventsRead`/`EventsWritten` and a `Cursor` —
@@ -850,6 +896,7 @@ checkChangeStreams
 cd /opt/docdb-migration/compose
 cp .env.sample .env   # edit DOCDB_SRC, MDB_DEST, QUEUE, WORKFLOW_ID
 sed -i '/--namespace=\${NAMESPACE/d' docker-compose.yml   # only if migrating ALL databases
+# add --max-partitions=500 to the runner's `run` leg in docker-compose.yml (§3 / §T9) — large source DBs stall in planning without it
 
 # --- Launch ---
 docker compose up -d temporal
@@ -857,7 +904,7 @@ docker compose up -d --scale worker=3 worker
 docker compose up -d runner
 
 # --- Monitor (repeat throughout) ---
-docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
+docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>   # Pending Activities must not stay empty (§T9-B)
 
 # --- Create empty collections dsync skipped (BEFORE indexes — §7.5) ---
 mongosh "$DOCDB_SRC" --quiet --file ${PREFIX}/scripts/create-empty-collections.js            # dry run
@@ -1103,6 +1150,7 @@ command:
       - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
       - "--queue-name=${QUEUE:?set QUEUE in .env}"
       - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+      - --max-partitions=500   # keep whatever you set per §3 — don't drop it when pasting this
       - temporal
       - --host-port=temporal:7233
       - app
@@ -1467,4 +1515,180 @@ This trades exhaustiveness for safety — it won't catch every possible
 mismatch the way a full `verify` pass does, but it's a reasonable
 lower-risk sanity check on a host that can't safely run a full pass, or as
 a quick spot-check between full `verify` runs.
+
+---
+
+## T9. Workflow never leaves planning — `WorkflowTaskTimedOut` loop, `Pending Activities = 0`, worker logs `context deadline exceeded`
+
+Diagnosed live on the `prod-svoc` run (2026-10-14). The worker log line
+looks like a connectivity problem; the Temporal event history proves it is
+not. **Read the history first** — it takes one command and rules out an hour
+of network/CA/allow-list chasing.
+
+### Two different `context deadline exceeded` errors — don't conflate them
+
+| When | Worker log line | What it actually is | Go to |
+|---|---|---|---|
+| At worker **start** | `... context deadline exceeded ... Namespace=default` — **no** `TaskQueue=`/`WorkerType=` fields | Startup race: the worker reached for `temporal:7233` before the Temporal server was serving. | §T9-A |
+| While **running** | `Task processing failed ... Namespace=default TaskQueue=<QUEUE> WorkerType=WorkflowWorker Error="context deadline exceeded"`, repeating every ~10s | The worker *is* connected (it received a task). A **workflow task** is blowing Temporal's default 10s `WorkflowTaskTimeout`, over and over. | §T9-B |
+
+### T9-A. Startup race — worker started before Temporal was serving
+
+`temporalio/temporal ... server start-dev` needs a few seconds after the
+container shows `Up` before `:7233` answers and the `default` namespace
+exists. The compose template's `depends_on: [temporal]` has **no health
+condition**, so `worker`/`runner` start the moment the *container* exists.
+Workers brought up in the same breath as `temporal` log one or more of these
+lines; with `restart: unless-stopped` they normally recover unaided. If the
+line keeps repeating:
+```bash
+docker compose ps                                                # temporal Up, not Restarting (else: SQLite fix, §4)
+docker compose logs --tail=20 temporal                           # "Temporal Server: 0.0.0.0:7233"
+docker compose exec temporal temporal operator cluster health    # expect SERVING
+docker compose up -d --force-recreate worker
+```
+If `operator cluster health` itself hangs, Temporal isn't serving — back to §4.
+
+Optional compose hardening (**not yet validated on the POC host**) — gate
+`worker`/`runner` on a real health check instead of container existence:
+```yaml
+  temporal:
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  worker:
+    depends_on:
+      temporal:
+        condition: service_healthy
+  runner:
+    depends_on:
+      temporal:
+        condition: service_healthy
+```
+
+### T9-B. `WorkflowTaskTimedOut` loop after planning — oversized read plan
+
+**Symptom set — all three together:**
+- `workflow describe`: workflow `Running`, `Pending Activities` **empty and
+  unchanging** across repeated checks.
+- `docker compose logs temporal`: no errors at all.
+- `docker compose logs worker`: `Task processing failed ...
+  WorkerType=WorkflowWorker Error="context deadline exceeded"` every ~10s.
+
+**The definitive check is the event history:**
+```bash
+docker compose exec temporal temporal workflow show --workflow-id <WORKFLOW_ID> | tail -40
+```
+Fingerprint observed live on `prod-svoc`:
+```
+ 1     WorkflowExecutionStarted
+ 2-4   WorkflowTaskScheduled / Started / Completed       (instant)
+ 5-7   ActivityTaskScheduled / Started / Completed       (instant — connect / capabilities check)
+ 8-10  WorkflowTaskScheduled / Started / Completed       (instant)
+11-13  ActivityTaskScheduled / Started / Completed       (26s — Read Planning, walks the whole source)
+14-15  WorkflowTaskScheduled / Started
+16     WorkflowTaskTimedOut                              (exactly 10s later)
+17-18  WorkflowTaskScheduled / Started
+19     WorkflowTaskTimedOut                              (exactly 10s later)
+...    repeats indefinitely
+```
+
+What that history proves — and why the obvious theories are wrong:
+- **Connectivity is fine.** Activity 2 (Read Planning) ran *on a worker*,
+  talked to the source for 26 seconds, and **completed**. Workers can reach
+  DocumentDB. Do not chase the Atlas allow-list, the `tlsCAFile` path, or the
+  §7.5 shell-override trap for this symptom.
+- **Temporal is fine.** Every `Scheduled → Started` gap is 0s; the server is
+  responsive. Do not chase slow-SQLite/IOPS theories for this symptom.
+- **The workflow task that *consumes* the read plan is what dies** — at
+  exactly 10s, which is Temporal's default `WorkflowTaskTimeout`. The
+  worker's `context deadline exceeded` is that same deadline seen from its
+  side. Because the task never completes, the Initial Copy activities are
+  never scheduled → `Pending Activities = 0`, forever.
+
+**Why:** dsync schedules every initial-sync partition as its own Temporal
+activity, all at once, in that single workflow task — which is why the
+compose template raises `limit.numPendingActivities.error` from Temporal's
+default 2000 to 10000. On a large database, `--doc-partition=500000` yields
+thousands of partitions; the workflow has to replay, deserialize that plan,
+and emit thousands of `ScheduleActivity` commands (each carrying its `_id`
+range) inside 10s. It can't. Temporal times the task out, re-dispatches it
+with the identical plan, and it hits the identical wall. `dsynct run` does
+not expose the workflow-task timeout (§T4), so the fix is to shrink the work
+per workflow task — dsynct's own `run --max-partitions` exists for exactly
+this (*"split initial sync into multiple workflows above this partition
+count"*, default `0` = unlimited).
+
+**Confirm before changing anything (optional, ~2 min):**
+```bash
+docker compose exec temporal temporal workflow show --workflow-id <WORKFLOW_ID> -o json > /tmp/history.json
+
+# activity types in the run — the second one is the planner
+jq -r '.events[] | select(.eventType|test("ACTIVITY_TASK_SCHEDULED")) | .activityTaskScheduledEventAttributes.activityType.name' /tmp/history.json
+
+# size/shape of the read plan the planner returned (event 13 in the fingerprint above — adjust if yours differs)
+jq -r '.events[] | select(.eventId=="13") | .activityTaskCompletedEventAttributes.result.payloads[0].data' /tmp/history.json \
+  | base64 -d > /tmp/readplan.json
+wc -c /tmp/readplan.json; head -c 1500 /tmp/readplan.json
+
+# what the worker said inside the fatal 10s window (use the planner's completion time from `workflow show`)
+docker compose logs worker --since <YYYY-MM-DDTHH:MM:SSZ> --until <YYYY-MM-DDTHH:MM:SSZ>
+```
+(Or SSH-tunnel `:8233`, open the Temporal UI, click the planner's
+`ActivityTaskCompleted` event — the result is displayed inline.) A plan of
+hundreds of KB with thousands of partition entries confirms the diagnosis.
+
+**Fix:**
+
+1. Add `--max-partitions` to the runner's `run` leg in `docker-compose.yml`
+   (same snippet as §3):
+   ```yaml
+     runner:
+       command:
+         - run
+         - "--workflow-id=${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
+         - "--queue-name=${QUEUE:?set QUEUE in .env}"
+         - "--namespace=${NAMESPACE:?set NAMESPACE in .env}"
+         - --max-partitions=500        # <-- child workflows of <=500 partitions each
+         - temporal
+         - --host-port=temporal:7233
+         - app
+         - --host-port=0.0.0.0:8080
+         - --persist
+   ```
+2. Optionally raise `DOC_PARTITION` in `.env` (e.g. `2000000`) to cut the
+   partition count outright. With 3 workers × 4 concurrent activities only
+   ~12 tasks are in flight at any moment; thousands of small partitions buy
+   nothing. The `.env.sample` comment only warns against going *lower*.
+3. Terminate the stuck run, clear the persisted plan, resubmit (§T6
+   mechanics — `restart` will **not** re-read the compose file):
+   ```bash
+   docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> \
+     --reason "workflow task timeout: oversized read plan, resubmitting with --max-partitions"
+
+   # The read plan is persisted in dsync's metadata DB on the DESTINATION; clear it so the
+   # new partitioning actually takes effect. Nothing has been copied yet, so this is safe
+   # for THIS flow — but `adiom-internal` is shared per Atlas cluster. If other dsync flows
+   # (DPS, MI, ...) are live against the same cluster, inspect before dropping blindly:
+   #   mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').getCollectionNames()"
+   mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').dropDatabase()"
+
+   docker compose up -d --force-recreate runner
+   docker compose logs -f runner                # expect "Started workflow workflow-id=..."
+   ```
+4. Verify it's past the wall:
+   ```bash
+   docker compose exec temporal temporal workflow describe --workflow-id <WORKFLOW_ID>
+   ```
+   Success: `Pending Activities` populated with `dsync_InitialSync` entries
+   (and/or child workflows listed), and `workflow show` continuing
+   `WorkflowTaskCompleted → ActivityTaskScheduled ×N` instead of
+   `WorkflowTaskTimedOut`.
+
+**If the read plan turns out to be small** (a few KB, a handful of
+partitions), the 10s is being eaten by something else in that task — check
+the owning worker's CPU with `docker stats` during the window before
+changing partitioning.
 </content>
