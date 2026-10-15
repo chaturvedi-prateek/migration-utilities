@@ -1,6 +1,6 @@
 # DocumentDB → Atlas Migration Runbook (dsync Enterprise + Temporal)
 
-Consolidated from the POC run against `maruti-poc-docdb-cluster`. Every command
+Consolidated from the POC run against `docdb-cluster`. Every command
 here was actually executed and validated during that run — including the
 mistakes, which is why the pre-flight section is non-negotiable.
 
