@@ -123,7 +123,11 @@ link() {  # link <source> <name>
 }
 
 # ------------------------------------------------------- dsynct (Enterprise) --
-log "installing Enterprise dsynct"
+log "installing dsynct (from ${DSYNCT_SOURCE:-bundle})"
+if [[ "${DSYNCT_MODE:-binary}" == "image" ]]; then
+  warn "dsynct was taken from ${DSYNCT_IMAGE:-a public image}, labelled \"trial\" on Docker Hub."
+  warn "Its licence is evaluation-only — confirm production licensing with Adiom."
+fi
 install -m 0755 "payload/dsynct/dsynct-linux-${GOARCH}" "${LIBEXEC}/dsynct"
 link "${LIBEXEC}/dsynct" dsynct
 
@@ -167,6 +171,36 @@ if [[ -f compose/Dockerfile.dsynct ]]; then
   cp compose/Dockerfile.dsynct "${PREFIX}/compose/"
 fi
 ok "compose files -> ${PREFIX}/compose/"
+
+# ------------------------------------------------- CDC / ops helper scripts ---
+# Kept together under ${PREFIX}/helpers (they locate ../compose and ../cdctest
+# relative to their real path) and symlinked onto PATH; the .js is run via
+# mongosh --file, so it is not linked.
+if [[ -d payload/helpers ]]; then
+  mkdir -p "${PREFIX}/helpers"
+  for f in ${CDC_HELPERS:-}; do
+    if [[ -f "payload/helpers/${f}" ]]; then
+      case "$f" in
+        *.js) install -m 0644 "payload/helpers/${f}" "${PREFIX}/helpers/${f}" ;;
+        *)    install -m 0755 "payload/helpers/${f}" "${PREFIX}/helpers/${f}"
+              link "${PREFIX}/helpers/${f}" "$f" ;;
+      esac
+    else
+      warn "${f} is not in this bundle"
+    fi
+  done
+  ok "CDC helpers -> ${PREFIX}/helpers/"
+fi
+# The test kit's .env is operator-owned: never overwrite one already filled in.
+if [[ -f payload/cdctest/docker-compose.yml ]]; then
+  mkdir -p "${PREFIX}/cdctest"
+  cp payload/cdctest/docker-compose.yml payload/cdctest/.env.sample "${PREFIX}/cdctest/"
+  install -m 0755 payload/cdctest/run-cdc-test.sh "${PREFIX}/cdctest/run-cdc-test.sh"
+  ok "CDC test kit -> ${PREFIX}/cdctest/"
+fi
+if [[ -f payload/dsynct/LICENSE.md ]]; then
+  install -m 0644 payload/dsynct/LICENSE.md "${PREFIX}/dsynct-LICENSE.md"
+fi
 
 # ------------------------------------------------------------ OS packages ----
 # Installs tmux/screen/procps/curl AND (unless already present) the Docker
@@ -450,10 +484,32 @@ fi
 
 cat <<EOF
 
-Next steps — multi-worker topology:
+Pre-flight on the source, before starting any sync:
+
+    checkChangeStreams        # change streams enabled + retention >= 7 days
+    fixIdTypes --mode detect --config ${PREFIX}/configs/fixIdTypes.config.sample.json
+    # every collection must report [CLEAN] before the initial sync starts
+
+Choose the CDC stream topology BEFORE the initial sync (it cannot be changed
+on a running workflow):
+
+  1) Profile source write rates at peak (cluster-wide change stream):
+         CS_SECONDS=300 CS_OUT=cs-profile.json \\
+           mongosh "\$DOCDB_SRC" --quiet --file ${PREFIX}/helpers/cs-rate-profile.js
+     (use a host-side tlsCAFile=${PREFIX}/certs/global-bundle.pem here)
+  2) Pick the topology. One shared stream caps at ~1.9k ev/s across many
+     interleaved collections; hot collections need PER_NAMESPACE_STREAMS=true.
+         split-hot-cold.sh cs-profile.json --max-cold-rate 500 --all-namespaces all.txt
+     -> one non-overlapping flow per list, each with its own QUEUE/WORKFLOW_ID.
+  3) Optional: prove it with Adiom's stream-only tests against a SCRATCH cluster:
+         cd ${PREFIX}/cdctest && cp .env.sample .env    # fill in SCRATCH_MDB_DEST
+         ./run-cdc-test.sh T0   # then T1, T2;  ./run-cdc-test.sh down
+  4) Then start the initial sync — multi-worker topology:
 
     cd ${PREFIX}/compose
-    cp .env.sample .env        # fill in DOCDB_SRC, MDB_DEST, QUEUE, NAMESPACE
+    cp .env.sample .env        # fill in DOCDB_SRC, MDB_DEST, QUEUE, NAMESPACE,
+                               # PER_NAMESPACE_STREAMS, ATTEMPTS_BEFORE_PAUSE=3,
+                               # DSYNCT_OTEL / OTEL_EXPORTER_OTLP_ENDPOINT
 
     docker compose up -d temporal                          # coordinator
     docker compose up -d --scale worker=3 worker           # copy workers
@@ -462,9 +518,9 @@ Next steps — multi-worker topology:
     Temporal UI      http://<this-host>:8233
     dsynct dashboard http://<this-host>:8080
 
-Pre-flight on the source, before starting any sync:
+While it runs:
 
-    checkChangeStreams        # change streams enabled + retention >= 7 days
-    fixIdTypes --mode detect --config ${PREFIX}/configs/fixIdTypes.config.sample.json
-    # every collection must report [CLEAN] before the initial sync starts
+    dsync-progress.sh --interval 60   # per-stream read/written/lag, catch-up ratio
+    dsync-find-pauses.sh              # paused activities in child workflows;
+                                      # --unpause resets attempts + heartbeats
 EOF

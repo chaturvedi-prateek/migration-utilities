@@ -215,3 +215,9 @@ __marimo__/
 config.json
 **/config.json
 cosmosdb-to-mongodb/**/assessment/
+
+# Internal-only engagement notes, vendor correspondence and screenshots
+# (customer data; some screenshots contain credentials) — never publish
+docdb-to-mongodb/migration-toolkit/internal/
+docdb-to-mongodb/migration-toolkit/Screenshot*.png
+docdb-to-mongodb/migration-toolkit/response.md

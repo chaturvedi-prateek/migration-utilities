@@ -1323,9 +1323,13 @@ aws ec2 describe-instances --instance-ids <instance-id> \
 docker compose exec temporal temporal workflow terminate \
   --workflow-id <WORKFLOW_ID> --reason "<reason>"
 
-# 2. Drop dsync's internal metadata/progress DB on the DESTINATION — clears
-#    any stored resume token so the new run starts genuinely fresh
-mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').dropDatabase()"
+# 2. Drop dsync's internal metadata/progress DB on the DESTINATION, IF IT EXISTS —
+#    clears any stored resume token so the new run starts genuinely fresh.
+#    In the Temporal topology this DB is normally absent (plan/progress live in
+#    Temporal workflow state; a terminate + resubmit is already a fresh start).
+#    It is populated by simple-mode `sync` runs. Check first:
+mongosh "$MDB_DEST" --eval "printjson(db.getSiblingDB('adiom-internal').getCollectionNames())"
+# mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').dropDatabase()"   # only if present
 
 # 3. Resubmit
 docker compose restart runner
@@ -1520,7 +1524,7 @@ a quick spot-check between full `verify` runs.
 
 ## T9. Workflow never leaves planning — `WorkflowTaskTimedOut` loop, `Pending Activities = 0`, worker logs `context deadline exceeded`
 
-Diagnosed live on the `prod-svoc` run (2026-10-14). The worker log line
+**Validated live.** The worker log line
 looks like a connectivity problem; the Temporal event history proves it is
 not. **Read the history first** — it takes one command and rules out an hour
 of network/CA/allow-list chasing.
@@ -1581,7 +1585,7 @@ Optional compose hardening (**not yet validated on the POC host**) — gate
 ```bash
 docker compose exec temporal temporal workflow show --workflow-id <WORKFLOW_ID> | tail -40
 ```
-Fingerprint observed live on `prod-svoc`:
+Fingerprint observed live:
 ```
  1     WorkflowExecutionStarted
  2-4   WorkflowTaskScheduled / Started / Completed       (instant)
@@ -1640,7 +1644,8 @@ docker compose logs worker --since <YYYY-MM-DDTHH:MM:SSZ> --until <YYYY-MM-DDTHH
 `ActivityTaskCompleted` event — the result is displayed inline.) A plan of
 hundreds of KB with thousands of partition entries confirms the diagnosis.
 
-**Fix:**
+**Fix (validated live — the run proceeded to `dsync_InitialSync` on the
+first resubmit):**
 
 1. Add `--max-partitions` to the runner's `run` leg in `docker-compose.yml`
    (same snippet as §3):
@@ -1668,12 +1673,13 @@ hundreds of KB with thousands of partition entries confirms the diagnosis.
    docker compose exec temporal temporal workflow terminate --workflow-id <WORKFLOW_ID> \
      --reason "workflow task timeout: oversized read plan, resubmitting with --max-partitions"
 
-   # The read plan is persisted in dsync's metadata DB on the DESTINATION; clear it so the
-   # new partitioning actually takes effect. Nothing has been copied yet, so this is safe
-   # for THIS flow — but `adiom-internal` is shared per Atlas cluster. If other dsync flows
-   # (DPS, MI, ...) are live against the same cluster, inspect before dropping blindly:
+   # In this Temporal topology dsynct keeps the read plan in Temporal workflow state, so a
+   # terminate + resubmit already yields a fresh plan. `adiom-internal` on the DESTINATION
+   # is only populated by simple-mode (`sync`) runs — observed absent on a live Temporal run.
+   # Drop it only if it exists, and only after checking no other dsync flow against the same
+   # Atlas cluster is using it:
    #   mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').getCollectionNames()"
-   mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').dropDatabase()"
+   # mongosh "$MDB_DEST" --eval "db.getSiblingDB('adiom-internal').dropDatabase()"   # only if present
 
    docker compose up -d --force-recreate runner
    docker compose logs -f runner                # expect "Started workflow workflow-id=..."

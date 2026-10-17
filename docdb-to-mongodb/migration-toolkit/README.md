@@ -4,9 +4,9 @@ Two scripts that stage and install the complete toolchain a **DocumentDB →
 Atlas** migration host needs, for in-VPC EC2 hosts with **no internet access**.
 
 - `fetch-docdb-migration-toolkit.sh` runs on a bastion / jump host that *does*
-  have internet access **and Docker**. It downloads every tool, builds the
-  `dsynct` container image, saves the Temporal image, and packs everything into
-  a single self-checksumming tarball.
+  have internet access **and Docker**. It downloads every tool, pulls (or
+  builds) the `dsynct` container image, saves the Temporal image, and packs
+  everything into a single self-checksumming tarball.
 - `install-docdb-migration-toolkit.sh` runs on the air-gapped migration host,
   from inside the unpacked tarball. It verifies checksums, installs the native
   binaries, and `docker load`s the images.
@@ -38,6 +38,11 @@ mongosync.
 | `migrateIndexes`        | binary          | Post-sync index create, then `--mode=rectify` at cutover        |
 | `checkChangeStreams`    | binary          | Confirms change streams are enabled with sufficient retention   |
 | `copyMissingDocs`       | binary          | Reconciles per-collection count gaps found during verification  |
+| `cs-rate-profile.js`    | mongosh script  | Source change-stream write rate per namespace / operation (§5)  |
+| `split-hot-cold.sh`     | script          | Splits namespaces into non-overlapping hot / cold flows (§5)    |
+| `dsync-progress.sh`     | script          | CDC buffer gap, lag, catch-up ratio per stream partition (§5)   |
+| `dsync-find-pauses.sh`  | script          | Finds / unpauses paused activities in child workflows (§5)      |
+| `cdctest/`              | compose kit     | Stream-only CDC throughput tests T0/T1/T2 on a scratch target   |
 | `tmux` / `screen`       | OS package      | Persistent session (optional — containers cover this)           |
 | `procps` (`watch`)      | OS package      | Progress-monitor loop (optional)                                |
 | `curl`                  | OS package      | dsynct progress API calls                                       |
@@ -51,27 +56,46 @@ otherwise incorrect. When skipped, the bundle contains a
 `NEEDED-OS-PACKAGES.txt` listing what to install, and the installer prints
 root-free substitutes.
 
-## The Enterprise binary
+## Getting dsynct — Docker Hub image or a supplied binary
 
-`dsynct` is a **licensed MongoDB/Adiom Enterprise artifact**. This toolkit never
-downloads it. Supply it with `--dsynct-bin`, pointing at the build matching the
-**target** architecture (both `amd64` and `arm64` are shipped by Adiom):
+`dsynct` is Adiom's Enterprise (Temporal-coordinated) dsync. The fetch script
+gets it one of two ways — pass at most one of the two flags:
 
-```bash
-./fetch-docdb-migration-toolkit.sh --dsynct-bin /path/to/amd/dsynct
-```
+1. **Docker Hub image (default when no binary is found).** Pulls
+   `markadiom/dsynct:latest` (or `--dsynct-image <ref>` / `$DSYNCT_IMAGE`) for
+   the target platform, pins it by digest, copies `/dsynct` out into the bundle
+   as the native binary, and adds a one-line layer with the AWS DocumentDB CA
+   at `/certs/global-bundle.pem` (the public image does not ship it, and every
+   `tlsCAFile` in `.env` points there). The result is tagged
+   `dsynct:enterprise`, so compose files and runbook commands are unchanged.
+   The image ref, digest and dsynct version are recorded in the bundle
+   manifest.
 
-With no flag the script also checks, in order:
+   ```bash
+   ./fetch-docdb-migration-toolkit.sh --dsynct-image markadiom/dsynct:latest
+   ```
 
-```
-$DSYNCT_BIN
-~/Documents/Tools/dsync-enterprise/{amd,arm}/dsynct
-~/dsync-enterprise/{amd,arm}/dsynct
-./vendor/dsynct/dsynct-linux-{amd64,arm64}
-```
+   > **Licence:** the public image ships an evaluation licence
+   > (`/LICENSE.md`, copied into the bundle and installed as
+   > `<prefix>/dsynct-LICENSE.md`). Get written confirmation from Adiom that
+   > production use is covered for your engagement before using it in
+   > production. Both scripts print this warning.
 
-Do not commit the binary to this repository or publish the produced bundle —
-both contain licensed code.
+2. **A supplied binary.** `--dsynct-bin <path>` with the build matching the
+   **target** architecture (Adiom ships `amd64` and `arm64`). The image is then
+   built `FROM alpine` with a single `COPY`. With neither flag the script looks
+   for a binary at, in order:
+
+   ```
+   $DSYNCT_BIN
+   ~/Documents/Tools/dsync-enterprise/{amd,arm}/dsynct
+   ~/dsync-enterprise/{amd,arm}/dsynct
+   ./vendor/dsynct/dsynct-linux-{amd64,arm64}
+   ```
+
+   and only falls back to the Docker Hub image when none exists.
+
+Do not commit a supplied binary to this repository.
 
 Note the distinction the plan documents draw: the **OSS `dsync`** binary lacks
 `--namespace-fanout` / `--documentdb-sampling-fanout` in v0.27.0 and earlier,
@@ -95,7 +119,8 @@ mistake is caught.
 ## 1. Fetch the bundle (online bastion)
 
 ```bash
-./fetch-docdb-migration-toolkit.sh --dsynct-bin ~/dsync-enterprise/amd/dsynct
+./fetch-docdb-migration-toolkit.sh --os amazon2023 --arch x86_64 \
+  --dsynct-image markadiom/dsynct:latest --outdir ./dist
 ```
 
 Defaults target x86_64 with the bastion's own OS. Override as needed:
@@ -116,9 +141,10 @@ Defaults target x86_64 with the bastion's own OS. Override as needed:
 | -------------------------- | ------------------------------------------------- | -------------------------- |
 | `--arch <x86_64\|aarch64>` | Target CPU architecture                           | `x86_64`                   |
 | `--os <id>`                | `rhel9` \| `ubuntu2204` \| `amazon2` \| `amazon2023` | detected                |
+| `--dsynct-image <ref>`     | Pull dsynct from this image (excl. `--dsynct-bin`) | `markadiom/dsynct:latest` if no binary found |
 | `--dsynct-bin <path>`      | Enterprise `dsynct` for the target arch           | see above                  |
-| `--dsynct-tag <ref>`       | Tag for the built dsynct image                    | `dsynct:enterprise`        |
-| `--dsynct-base <image>`    | Base image for dsynct                             | `alpine:3.20`              |
+| `--dsynct-tag <ref>`       | Tag for the resulting dsynct image                | `dsynct:enterprise`        |
+| `--dsynct-base <image>`    | Base image when building from `--dsynct-bin`      | `alpine:3.20`              |
 | `--temporal-image <ref>`   | Temporal CLI image                                | `temporalio/temporal:1.8.2` |
 | `--mongosh-version <v>`    | mongosh version                                   | `2.3.8`                    |
 | `--jq-version <v>`         | jq version                                        | `1.7.1`                    |
@@ -137,9 +163,10 @@ docdb-migration-toolkit-<os>-<arch>-<stamp>.tar.gz
 docdb-migration-toolkit-<os>-<arch>-<stamp>.tar.gz.sha256
 ```
 
-The dsynct image is built `FROM alpine` with a single `COPY` — because dsynct is
-a statically linked Go binary and no build instruction executes, a foreign-arch
-build works on the bastion without qemu.
+Neither dsynct path executes a build instruction (`FROM alpine` + `COPY` for a
+supplied binary, `FROM <pinned digest>` + `COPY` of the CA for the image), so a
+foreign-arch bundle builds on the bastion without qemu. The fetch script needs
+the `helpers/` folder next to it — commit the two together.
 
 ## 2. Transfer and install (migration host)
 
@@ -216,7 +243,47 @@ validation runs:
   config. Different configs need a different `QUEUE`, or tasks get mixed.
 
 `DOCDB_SRC` in `.env` must set `tlsCAFile=/certs/global-bundle.pem` — the
-in-container path where the image ships the AWS bundle.
+in-container path where the image ships the AWS bundle. (Tools run on the
+host, e.g. `mongosh`, need the host path `<prefix>/certs/global-bundle.pem`.)
+
+### Decide the CDC stream topology BEFORE the initial sync
+
+By default dsynct reads **all** namespaces through **one** change stream, and
+its writer flushes every time consecutive events belong to different
+namespaces. With many concurrently written collections, batches collapse to
+~1 event and CDC caps at roughly **2k events/s** no matter how many workers,
+`--per-stream-workers` or batch size you configure. The fix is a choice made
+when the workflow starts — it **cannot** be changed on a running workflow, and
+a new flow cannot resume CDC from an earlier point — so get it right up front:
+
+- Profile the source's write rate per namespace (`cs-rate-profile.js`, §5).
+- Busy namespaces → a flow with `PER_NAMESPACE_STREAMS=true` (one stream per
+  namespace). The low-traffic tail can share one stream in a second flow.
+  Flows must **never overlap** in namespaces; each needs its own `QUEUE`,
+  `WORKFLOW_ID` and workers. A second flow runs as its own compose project
+  against the same Temporal (`TEMPORAL_ADDR=host.docker.internal:7233`, own
+  `DASHBOARD_PORT`).
+- Every stream partition holds **2 activity slots** (StreamChanges +
+  StreamLSN): `CONCURRENT_ACTIVITIES × workers ≥ 2 × streams`, plus whatever
+  initial-sync concurrency you want, or some streams never start.
+- Prove it first with the stream-only tests in `cdctest/` against a scratch
+  cluster.
+
+The full procedure is in [CDC-TOPOLOGY-PLAYBOOK.md](CDC-TOPOLOGY-PLAYBOOK.md).
+
+### Compose toggles (`.env`)
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `PER_NAMESPACE_STREAMS` | connector `--per-namespace-streams` (one stream per namespace) | `false` |
+| `ATTEMPTS_BEFORE_PAUSE` | worker `--attempts-before-pause` with `--pause-on-error`; a container restart counts as an error | `3` |
+| `SKIP_INITIAL_SYNC` | runner `--skip-initial-sync` — stream-only (reverse CDC, tests) | `false` |
+| `DSYNCT_OTEL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_METRIC_INTERVAL` | `app --otel …` OTLP/gRPC export of dsynct logs + metrics (e.g. to SigNoz) | off |
+| `TEMPORAL_ADDR`, `DASHBOARD_PORT` | point a second flow's compose project at the shared Temporal; its dashboard port | `temporal:7233`, `8080` |
+
+`NAMESPACE` accepts a comma-separated list (`db.coll1,db.coll2`).
+`NAMESPACE_FANOUT` only affects planning concurrency — not CDC.
+When unpausing an activity, always pass `--reset-attempts`.
 
 ### Verify the work is actually distributed
 
@@ -240,6 +307,33 @@ fixIdTypes --mode detect --config config.json
 Every collection must report `[CLEAN]`. dsynct partitions by `_id` range and
 **fails the whole flow plan** on a collection with mixed BSON `_id` types. Sample
 configs for each tool are installed under `<prefix>/configs/`.
+
+## 5. CDC helpers
+
+Installed under `<prefix>/helpers` (the `.sh` ones are also on `PATH`) and
+`<prefix>/cdctest`:
+
+```bash
+# write rate per namespace at PEAK traffic (host CA path in the URI)
+CS_SECONDS=300 CS_OUT=cs-profile.json \
+  mongosh "$DOCDB_SRC_HOST" --quiet --file <prefix>/helpers/cs-rate-profile.js
+
+# hot (per-namespace streams) / cold (shared stream) namespace lists
+split-hot-cold.sh cs-profile.json --max-cold-rate 500 --all-namespaces all.txt
+
+# CDC progress: buffer gap, lag, LSN-read, and catch-up ratio over 60 s
+dsync-progress.sh --workflow-id <wf> --interval 60
+
+# paused activities anywhere in the workflow tree (child workflows included)
+dsync-find-pauses.sh --workflow-id <wf>            # report
+dsync-find-pauses.sh --workflow-id <wf> --unpause  # unpause with --reset-attempts
+
+# stream-only throughput tests on a SCRATCH destination (refuses prod MDB_DEST)
+cd <prefix>/cdctest && cp .env.sample .env && ./run-cdc-test.sh T0|T1|T2|status|down
+```
+
+A constant non-zero `gap` (EventsRead − EventsWritten) means the writer is the
+bottleneck; a catch-up ratio below 1.0 means the stream is falling behind.
 
 ## Verify only
 

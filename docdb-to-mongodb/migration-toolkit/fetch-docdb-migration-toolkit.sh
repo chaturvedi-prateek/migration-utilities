@@ -8,10 +8,19 @@
 # packs them into a single tarball that can be copied (scp / sneakernet) to the
 # in-VPC EC2 hosts, where install-docdb-migration-toolkit.sh unpacks them.
 #
-# Enterprise dsync (dsynct) is NEVER downloaded — it is a licensed binary that
-# you supply with --dsynct-bin. Temporal and dsynct are staged as saved Docker
-# images; everything else installs as native binaries.
+# dsynct comes from one of two sources:
+#   --dsynct-bin    a licensed Enterprise binary you supply; the image is built
+#                   from it (also used when a binary is found at the usual
+#                   local paths).
+#   --dsynct-image  otherwise: Adiom's public image (default
+#                   markadiom/dsynct:latest) is pulled for the target platform,
+#                   the binary is extracted from it, and the AWS CA bundle is
+#                   layered on top. Docker Hub labels this image "trial" —
+#                   confirm production licensing with Adiom before using it.
+# Temporal and dsynct are staged as saved Docker images; everything else
+# installs as native binaries.
 #
+#   ./fetch-docdb-migration-toolkit.sh --os amazon2023      # public image
 #   ./fetch-docdb-migration-toolkit.sh --dsynct-bin ~/dsync-enterprise/amd/dsynct
 #   ./fetch-docdb-migration-toolkit.sh --arch aarch64 --os ubuntu2204 \
 #       --dsynct-bin ~/dsync-enterprise/arm/dsynct
@@ -22,6 +31,8 @@ set -euo pipefail
 ARCH="x86_64"
 TARGET_OS=""                    # auto-detected below if not supplied
 DSYNCT_BIN="${DSYNCT_BIN:-}"    # licensed Enterprise binary — never downloaded
+DSYNCT_IMAGE="${DSYNCT_IMAGE:-}" # public image used when no binary is supplied
+DSYNCT_IMAGE_DEFAULT="markadiom/dsynct:latest"
 DSYNCT_TAG="dsynct:enterprise"
 DSYNCT_BASE="alpine:3.20"
 TEMPORAL_IMAGE="temporalio/temporal:1.8.2"
@@ -45,11 +56,17 @@ Usage: fetch-docdb-migration-toolkit.sh [options]
   --os <id>                   Target OS: rhel9 | ubuntu2204 | amazon2 |
                               amazon2023                     (default: detected)
   --dsynct-bin <path>         Enterprise dsynct binary for the TARGET arch.
-                              Required. Falls back to $DSYNCT_BIN, then to the
-                              usual local checkout paths (see --help output of
-                              the README).
-  --dsynct-tag <ref>          Tag for the built dsynct image  (default: dsynct:enterprise)
-  --dsynct-base <image>       Base image for dsynct           (default: alpine:3.20)
+                              Falls back to $DSYNCT_BIN, then to the usual
+                              local checkout paths (see the README). The image
+                              is built from it.
+  --dsynct-image <ref>        Public dsynct image to pull when no binary is
+                              given/found; the binary is extracted from it.
+                              Falls back to $DSYNCT_IMAGE.
+                              (default: markadiom/dsynct:latest — labelled
+                              "trial" on Docker Hub; confirm licensing with Adiom)
+  --dsynct-tag <ref>          Tag for the staged dsynct image (default: dsynct:enterprise)
+  --dsynct-base <image>       Base image for dsynct when built from --dsynct-bin
+                                                              (default: alpine:3.20)
   --temporal-image <ref>      Temporal CLI image              (default: temporalio/temporal:1.8.2)
   --mongosh-version <v>       mongosh version                 (default: 2.3.8)
   --jq-version <v>            jq version                      (default: 1.7.1)
@@ -73,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --arch)             ARCH="$2"; shift 2 ;;
     --os)               TARGET_OS="$2"; shift 2 ;;
     --dsynct-bin)       DSYNCT_BIN="$2"; shift 2 ;;
+    --dsynct-image)     DSYNCT_IMAGE="$2"; shift 2 ;;
     --dsynct-tag)       DSYNCT_TAG="$2"; shift 2 ;;
     --dsynct-base)      DSYNCT_BASE="$2"; shift 2 ;;
     --temporal-image)   TEMPORAL_IMAGE="$2"; shift 2 ;;
@@ -130,9 +148,11 @@ case "$ARCH" in
 esac
 
 # ------------------------------------------------------ locate dsynct binary ---
-# Enterprise dsynct is licensed and has no public download. It must come from a
-# path the operator supplies; these fallbacks only cover the common local layout.
-if [[ -z "$DSYNCT_BIN" ]]; then
+# An explicit --dsynct-bin / --dsynct-image wins. With neither, a binary at the
+# common local layout is used; failing that, the public image is pulled.
+[[ -n "$DSYNCT_BIN" && -n "$DSYNCT_IMAGE" ]] \
+  && die "--dsynct-bin and --dsynct-image are mutually exclusive"
+if [[ -z "$DSYNCT_BIN" && -z "$DSYNCT_IMAGE" ]]; then
   case "$ARCH" in
     x86_64)  ARCH_DIR="amd" ;;
     aarch64) ARCH_DIR="arm" ;;
@@ -143,21 +163,32 @@ if [[ -z "$DSYNCT_BIN" ]]; then
       "${SCRIPT_DIR}/vendor/dsynct/dsynct-linux-${GOARCH}"; do
     if [[ -n "$cand" && -f "$cand" ]]; then DSYNCT_BIN="$cand"; break; fi
   done
+  [[ -n "$DSYNCT_BIN" ]] || DSYNCT_IMAGE="$DSYNCT_IMAGE_DEFAULT"
 fi
-[[ -n "$DSYNCT_BIN" ]] \
-  || die "no Enterprise dsynct binary found for ${ARCH}. Pass --dsynct-bin <path>.
-     This binary is licensed and is never downloaded by this script."
-[[ -f "$DSYNCT_BIN" ]] || die "--dsynct-bin path not found: ${DSYNCT_BIN}"
 
-# raw.githubusercontent serves HTML error pages with HTTP 200 in some failure
-# modes, and an arch mismatch here would only surface on the migration host.
-if command -v file >/dev/null 2>&1; then
-  DSYNCT_TYPE="$(file -b "$DSYNCT_BIN")"
+check_dsynct_elf() {  # check_dsynct_elf <path> <what>
+  command -v file >/dev/null 2>&1 || return 0
+  DSYNCT_TYPE="$(file -b "$1")"
   case "$ARCH:$DSYNCT_TYPE" in
     x86_64:*ELF*x86-64*|aarch64:*ELF*aarch64*) ;;
-    *) die "--dsynct-bin is not a Linux ${ARCH} ELF binary: ${DSYNCT_TYPE}" ;;
+    *) die "$2 is not a Linux ${ARCH} ELF binary: ${DSYNCT_TYPE}" ;;
   esac
   log "dsynct: ${DSYNCT_TYPE}"
+}
+
+if [[ -n "$DSYNCT_BIN" ]]; then
+  DSYNCT_MODE="binary"
+  [[ -f "$DSYNCT_BIN" ]] || die "--dsynct-bin path not found: ${DSYNCT_BIN}"
+  # raw.githubusercontent serves HTML error pages with HTTP 200 in some failure
+  # modes, and an arch mismatch here would only surface on the migration host.
+  check_dsynct_elf "$DSYNCT_BIN" "--dsynct-bin"
+  DSYNCT_SOURCE="$DSYNCT_BIN"
+else
+  DSYNCT_MODE="image"
+  DSYNCT_SOURCE="image:${DSYNCT_IMAGE}"
+  log "dsynct: no --dsynct-bin; using public image ${DSYNCT_IMAGE}"
+  warn "${DSYNCT_IMAGE} is labelled \"trial\" on Docker Hub and ships a trial LICENSE.md"
+  warn "(evaluation only, time-limited). Confirm production licensing with Adiom before use."
 fi
 
 # --------------------------------------------------------------- URL setup ---
@@ -206,7 +237,7 @@ STAGE="$(mktemp -d)"
 PKGDIR="${STAGE}/${BUNDLE_NAME}"
 trap 'rm -rf "$STAGE"' EXIT
 
-mkdir -p "${PKGDIR}"/payload/{dsynct,images,tools,configs} \
+mkdir -p "${PKGDIR}"/payload/{dsynct,images,tools,configs,helpers,cdctest} \
          "${PKGDIR}/os-packages" "${PKGDIR}/compose"
 mkdir -p "$OUTDIR"
 # Resolve to an absolute path: the checksum step below cd's into $OUTDIR, and a
@@ -251,7 +282,8 @@ for spec in "${PREFLIGHT_URLS[@]}"; do
   fi
 done
 
-if [[ "$SKIP_IMAGES" != "true" ]]; then
+# Image mode needs docker even with --skip-images: the binary comes from the image.
+if [[ "$SKIP_IMAGES" != "true" || "$DSYNCT_MODE" == "image" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
     warn "docker not found — Temporal and dsynct images cannot be staged"
     PREFLIGHT_FAIL=1
@@ -277,8 +309,58 @@ fetch "$DOCDB_CA_URL"        "${PKGDIR}/payload/global-bundle.pem"
 fetch "$DOCKER_COMPOSE_URL"  "${PKGDIR}/payload/${DOCKER_COMPOSE_BIN}"
 chmod +x "${PKGDIR}/payload/${DOCKER_COMPOSE_BIN}"
 
-log "staging Enterprise dsynct from ${DSYNCT_BIN}"
-install -m 0755 "$DSYNCT_BIN" "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}"
+DSYNCT_IMAGE_DIGEST=""
+if [[ "$DSYNCT_MODE" == "binary" ]]; then
+  log "staging Enterprise dsynct from ${DSYNCT_BIN}"
+  install -m 0755 "$DSYNCT_BIN" "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}"
+else
+  log "pulling ${DSYNCT_IMAGE} for ${DOCKER_PLATFORM}"
+  docker pull --platform "$DOCKER_PLATFORM" "$DSYNCT_IMAGE" \
+    || die "docker pull failed for ${DSYNCT_IMAGE}"
+  # Pin everything below to the manifest-list digest just pulled, so a tag
+  # moving on Docker Hub mid-run cannot mix two builds in one bundle.
+  if docker buildx version >/dev/null 2>&1; then
+    DSYNCT_IMAGE_DIGEST="$(docker buildx imagetools inspect "$DSYNCT_IMAGE" 2>/dev/null \
+      | awk '/^Digest:/ {print $2; exit}')"
+  fi
+  if [[ -z "$DSYNCT_IMAGE_DIGEST" ]]; then
+    DSYNCT_IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$DSYNCT_IMAGE" 2>/dev/null)"
+    DSYNCT_IMAGE_DIGEST="${DSYNCT_IMAGE_DIGEST##*@}"
+  fi
+  [[ "$DSYNCT_IMAGE_DIGEST" == sha256:* ]] || die "could not resolve the digest of ${DSYNCT_IMAGE}"
+  # Strip a :tag (but not a registry :port) before appending the digest.
+  DSYNCT_REPO="$DSYNCT_IMAGE"
+  [[ "${DSYNCT_IMAGE##*/}" == *:* ]] && DSYNCT_REPO="${DSYNCT_IMAGE%:*}"
+  DSYNCT_IMAGE_PINNED="${DSYNCT_REPO}@${DSYNCT_IMAGE_DIGEST}"
+  [[ "$DSYNCT_IMAGE" == *@* ]] && DSYNCT_IMAGE_PINNED="$DSYNCT_IMAGE"
+  log "dsynct image digest ${DSYNCT_IMAGE_DIGEST}"
+
+  # The image is distroless (no shell); the binary is /dsynct. docker create
+  # never runs it, so a foreign-arch image is fine here.
+  DSYNCT_CID="$(docker create --platform "$DOCKER_PLATFORM" "$DSYNCT_IMAGE_PINNED")" \
+    || die "docker create failed for ${DSYNCT_IMAGE_PINNED}"
+  docker cp "${DSYNCT_CID}:/dsynct" "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}" \
+    || { docker rm -f "$DSYNCT_CID" >/dev/null; die "no /dsynct binary in ${DSYNCT_IMAGE}"; }
+  docker cp "${DSYNCT_CID}:/LICENSE.md" "${PKGDIR}/payload/dsynct/LICENSE.md" 2>/dev/null \
+    || warn "no LICENSE.md in ${DSYNCT_IMAGE}"
+  docker rm -f "$DSYNCT_CID" >/dev/null
+  chmod 0755 "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}"
+  check_dsynct_elf "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}" "/dsynct in ${DSYNCT_IMAGE}"
+fi
+
+# ------------------------------------------------- CDC / ops helper scripts ---
+# Shipped from this script's own directory: they are part of the toolkit, not
+# of the migration-utilities helper repo.
+for f in cs-rate-profile.js split-hot-cold.sh dsync-progress.sh dsync-find-pauses.sh; do
+  [[ -f "${SCRIPT_DIR}/helpers/${f}" ]] || die "missing ${SCRIPT_DIR}/helpers/${f}"
+  install -m 0755 "${SCRIPT_DIR}/helpers/${f}" "${PKGDIR}/payload/helpers/${f}"
+done
+chmod 0644 "${PKGDIR}/payload/helpers/cs-rate-profile.js"
+for f in run-cdc-test.sh .env.sample; do
+  [[ -f "${SCRIPT_DIR}/helpers/cdctest/${f}" ]] || die "missing ${SCRIPT_DIR}/helpers/cdctest/${f}"
+  install -m 0644 "${SCRIPT_DIR}/helpers/cdctest/${f}" "${PKGDIR}/payload/cdctest/${f}"
+done
+chmod 0755 "${PKGDIR}/payload/cdctest/run-cdc-test.sh"
 
 # ------------------------------------------------------------- helper bins ---
 for spec in "${HELPERS[@]}"; do
@@ -331,7 +413,8 @@ if [[ "$SKIP_IMAGES" == "true" ]]; then
 else
   # dsynct is statically linked, so the image is FROM + COPY only. No build step
   # executes, which is why a foreign-arch build works here without qemu.
-  cat > "${PKGDIR}/compose/Dockerfile.dsynct" <<EOF
+  if [[ "$DSYNCT_MODE" == "binary" ]]; then
+    cat > "${PKGDIR}/compose/Dockerfile.dsynct" <<EOF
 # Generated by fetch-docdb-migration-toolkit.sh
 # dsynct is a statically linked Go binary — no libc, no runtime deps.
 FROM ${DSYNCT_BASE}
@@ -339,7 +422,18 @@ COPY dsynct /usr/local/bin/dsynct
 COPY global-bundle.pem /certs/global-bundle.pem
 ENTRYPOINT ["/usr/local/bin/dsynct"]
 EOF
-  cp "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}" "${PKGDIR}/compose/dsynct"
+    cp "${PKGDIR}/payload/dsynct/dsynct-linux-${GOARCH}" "${PKGDIR}/compose/dsynct"
+  else
+    # The public image has no /certs/global-bundle.pem, which every
+    # tlsCAFile in .env points at — add it as one COPY layer on the pinned
+    # digest instead of making each compose service mount it.
+    cat > "${PKGDIR}/compose/Dockerfile.dsynct" <<EOF
+# Generated by fetch-docdb-migration-toolkit.sh
+# ${DSYNCT_IMAGE} pinned by digest, plus the AWS DocumentDB CA bundle.
+FROM ${DSYNCT_IMAGE_PINNED}
+COPY global-bundle.pem /certs/global-bundle.pem
+EOF
+  fi
   cp "${PKGDIR}/payload/global-bundle.pem"             "${PKGDIR}/compose/global-bundle.pem"
 
   # A buildx container driver keeps the result in the build cache unless --load
@@ -388,6 +482,14 @@ cat > "${PKGDIR}/compose/docker-compose.yml" <<EOF
 #
 # Workers deliberately run with 'app --no-progress': several dsynct processes on
 # one host cannot all bind the progress port, and the runner already serves it.
+#
+# A second, non-overlapping flow (e.g. the cold namespaces) runs as its own
+# project against this Temporal — see "Stream topology" in .env.sample:
+#   docker compose -p flow-cold --env-file .env.cold up -d --no-deps \\
+#       --scale worker=2 worker runner
+#
+# Boolean knobs are passed as --flag=\${VAR:-default}; dsynct accepts
+# --flag=true / --flag=false for every boolean option.
 services:
   temporal:
     image: ${TEMPORAL_IMAGE}
@@ -415,15 +517,24 @@ services:
       - "--sync-writer-workers=\${SYNC_WRITER_WORKERS:-8}"
       - "--per-stream-workers=\${PER_STREAM_WORKERS:-4}"
       - --pause-on-error
+      - "--attempts-before-pause=\${ATTEMPTS_BEFORE_PAUSE:-3}"
       - "\${DOCDB_SRC:?set DOCDB_SRC in .env}"
       - "--doc-partition=\${DOC_PARTITION:-500000}"
       - "--namespace-fanout=\${NAMESPACE_FANOUT:-100}"
       - "--documentdb-sampling-fanout=\${DOCUMENTDB_SAMPLING_FANOUT:-100}"
+      - "--per-namespace-streams=\${PER_NAMESPACE_STREAMS:-false}"
       - "\${MDB_DEST:?set MDB_DEST in .env}"
       - temporal
-      - --host-port=temporal:7233
+      - "--host-port=\${TEMPORAL_ADDR:-temporal:7233}"
       - app
       - --no-progress
+      - "--otel=\${DSYNCT_OTEL:-false}"
+      - "--otel-service-name=\${OTEL_SERVICE_NAME:-dsynct}"
+      - "--otel-metric-interval=\${OTEL_METRIC_INTERVAL:-10s}"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "\${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   runner:
@@ -434,13 +545,21 @@ services:
       - "--workflow-id=\${WORKFLOW_ID:?set WORKFLOW_ID in .env}"
       - "--queue-name=\${QUEUE:?set QUEUE in .env}"
       - "--namespace=\${NAMESPACE:?set NAMESPACE in .env}"
+      - "--skip-initial-sync=\${SKIP_INITIAL_SYNC:-false}"
       - temporal
-      - --host-port=temporal:7233
+      - "--host-port=\${TEMPORAL_ADDR:-temporal:7233}"
       - app
       - --host-port=0.0.0.0:8080
       - --persist
+      - "--otel=\${DSYNCT_OTEL:-false}"
+      - "--otel-service-name=\${OTEL_SERVICE_NAME:-dsynct}"
+      - "--otel-metric-interval=\${OTEL_METRIC_INTERVAL:-10s}"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "\${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "8080:8080"   # dsynct progress dashboard
+      - "\${DASHBOARD_PORT:-8080}:8080"   # dsynct progress dashboard
     restart: on-failure
 
 volumes:
@@ -473,8 +592,135 @@ PER_STREAM_WORKERS=4
 # a few huge collections would otherwise not split into enough tasks to fill
 # the worker fleet.
 DOC_PARTITION=500000
+# Planning concurrency only (how many namespaces are planned at once). It does
+# NOT change change-stream throughput.
 NAMESPACE_FANOUT=100
 DOCUMENTDB_SAMPLING_FANOUT=100
+
+# ---------------------------------------------------------- stream topology --
+# DECIDE BEFORE THE INITIAL SYNC. Stream topology cannot be changed on a
+# running workflow, and a new flow cannot start CDC from a past timestamp.
+#
+# 1. Profile source write rates at peak first:
+#      CS_SECONDS=300 mongosh "$DOCDB_SRC" --quiet --file <toolkit>/helpers/cs-rate-profile.js
+# 2. With PER_NAMESPACE_STREAMS=false, ALL namespaces share ONE change stream
+#    whose writer flushes whenever the namespace changes between events. With
+#    many interleaved collections batches shrink to ~1 event and CDC caps at
+#    ~1.9k events/s, regardless of PER_STREAM_WORKERS, worker count or Atlas
+#    tier.
+# 3. PER_NAMESPACE_STREAMS=true gives every collection its own stream. Each
+#    stream holds 2 activity slots (StreamChanges + StreamLSN) for its whole
+#    life, so CONCURRENT_ACTIVITIES x WORKER_COUNT must be >= 2 x collections
+#    (plus headroom), or some collections never start streaming. Every
+#    worker of a flow must use the same value.
+# 4. For many collections, split into NON-OVERLAPPING flows with
+#    split-hot-cold.sh: hot collections with PER_NAMESPACE_STREAMS=true, the
+#    low-traffic tail on one shared stream. Each flow needs its own .env with a
+#    distinct QUEUE, WORKFLOW_ID, NAMESPACE list and DASHBOARD_PORT, and its
+#    own workers. Collections created later are in neither flow.
+# 5. Optionally prove the choice first with the CDC test kit (<toolkit>/cdctest,
+#    T0/T1/T2 against a SCRATCH cluster).
+PER_NAMESPACE_STREAMS=false
+
+# Stream-only flow: skip the initial copy and start CDC at the live head. Only
+# for stream-only / reverse-sync / test flows — never for the main migration.
+SKIP_INITIAL_SYNC=false
+
+# --pause-on-error pauses an activity after this many failed attempts. 0
+# pauses on the first error, and a routine worker restart counts as one.
+# Always unpause with --reset-attempts (dsync-find-pauses.sh --unpause does
+# this, plus --reset-heartbeats). Paused activities show only on the CHILD
+# workflow (e.g. <WORKFLOW_ID>/bulk-5), not on the parent.
+ATTEMPTS_BEFORE_PAUSE=3
+
+# Additional flows on this host reach the main Temporal via the host:
+#   TEMPORAL_ADDR=host.docker.internal:7233   DASHBOARD_PORT=8081
+TEMPORAL_ADDR=temporal:7233
+DASHBOARD_PORT=8080
+
+# -------------------------------------------------------------- OpenTelemetry --
+# Export dsynct logs + metrics over OTLP gRPC (key metrics: dsynct.read,
+# dsynct.written, dsynct.write_updates, dsynct.stream_read_gauge,
+# dsynct.stream_written_gauge, dsynct.read_ahead_gauge,
+# dsynct.since_last_event_time). With DSYNCT_OTEL=true logs go to the
+# collector as JSON. SigNoz dashboards:
+#   https://github.com/adiom-data/public/tree/main/kubernetes/system/signoz_dashboards
+DSYNCT_OTEL=false
+# e.g. http://otel-collector.example.internal:4317 (gRPC; required when DSYNCT_OTEL=true)
+OTEL_EXPORTER_OTLP_ENDPOINT=
+OTEL_SERVICE_NAME=dsynct
+OTEL_METRIC_INTERVAL=10s
+EOF
+
+# ------------------------------------------------------------ CDC test kit ---
+# Separate compose project ("cdctest", own Temporal on 17233/18233, dashboard
+# on 8082) for Adiom's stream-only T0/T1/T2 tests; driven by run-cdc-test.sh,
+# which sets CDC_DEST / PER_NAMESPACE_STREAMS / QUEUE / WORKFLOW_ID per test.
+# Defaults are the safe T0 values, so a bare `docker compose up` writes nowhere.
+cat > "${PKGDIR}/payload/cdctest/docker-compose.yml" <<EOF
+# Generated by fetch-docdb-migration-toolkit.sh — CDC throughput test kit.
+# Use ./run-cdc-test.sh T0|T1|T2|status|down rather than compose directly.
+name: cdctest
+services:
+  temporal:
+    image: ${TEMPORAL_IMAGE}
+    command:
+      - server
+      - start-dev
+      - --db-filename=/data/temporal.db
+      - --ip=0.0.0.0
+      - --dynamic-config-value=limit.numPendingActivities.error=10000
+      - --dynamic-config-value=frontend.activityAPIsEnabled=true
+    ports:
+      - "17233:7233"
+      - "18233:8233"
+    volumes:
+      - temporal-data:/data
+    restart: unless-stopped
+
+  worker:
+    image: ${DSYNCT_TAG}
+    depends_on: [temporal]
+    command:
+      - worker
+      - "--queue-name=\${QUEUE:-cdctest-T0}"
+      - "--concurrent-activities=\${CONCURRENT_ACTIVITIES:-4}"
+      - "--sync-writer-workers=\${SYNC_WRITER_WORKERS:-8}"
+      - "--per-stream-workers=\${PER_STREAM_WORKERS:-4}"
+      - --pause-on-error
+      - "--attempts-before-pause=\${ATTEMPTS_BEFORE_PAUSE:-3}"
+      - "\${DOCDB_SRC:?set DOCDB_SRC in cdctest/.env}"
+      - "--doc-partition=\${DOC_PARTITION:-500000}"
+      - "--namespace-fanout=\${NAMESPACE_FANOUT:-100}"
+      - "--documentdb-sampling-fanout=\${DOCUMENTDB_SAMPLING_FANOUT:-100}"
+      - "--per-namespace-streams=\${PER_NAMESPACE_STREAMS:-false}"
+      - "\${CDC_DEST:-/dev/null}"
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --no-progress
+    restart: unless-stopped
+
+  runner:
+    image: ${DSYNCT_TAG}
+    depends_on: [temporal]
+    command:
+      - run
+      - "--workflow-id=\${WORKFLOW_ID:-cdctest-T0}"
+      - "--queue-name=\${QUEUE:-cdctest-T0}"
+      - "--namespace=\${NAMESPACE:?set NAMESPACE in cdctest/.env}"
+      - --skip-initial-sync=true
+      - temporal
+      - --host-port=temporal:7233
+      - app
+      - --host-port=0.0.0.0:8080
+      - --persist
+    ports:
+      - "8082:8080"
+    restart: on-failure
+
+volumes:
+  temporal-data:
 EOF
 
 # ------------------------------------------------------------- OS packages ---
@@ -695,13 +941,25 @@ else
 fi
 
 # ------------------------------------------------------------- manifest ------
+# Best effort: a foreign-arch image only runs here when binfmt/qemu is set up.
+DSYNCT_VERSION="unknown"
+if [[ "$SKIP_IMAGES" != "true" ]]; then
+  DSYNCT_VERSION="$(docker run --rm --platform "$DOCKER_PLATFORM" "$DSYNCT_TAG" --version 2>/dev/null \
+    | awk '/version/ {print $NF; exit}')" || true
+  DSYNCT_VERSION="${DSYNCT_VERSION:-unknown}"
+fi
+
 cat > "${PKGDIR}/manifest.env" <<EOF
 # Generated by fetch-docdb-migration-toolkit.sh on $(hostname) at ${STAMP}
 BUNDLE_NAME="${BUNDLE_NAME}"
 TARGET_OS="${TARGET_OS}"
 ARCH="${ARCH}"
 GOARCH="${GOARCH}"
-DSYNCT_SOURCE="${DSYNCT_BIN}"
+DSYNCT_MODE="${DSYNCT_MODE}"
+DSYNCT_SOURCE="${DSYNCT_SOURCE}"
+DSYNCT_IMAGE="${DSYNCT_IMAGE}"
+DSYNCT_IMAGE_DIGEST="${DSYNCT_IMAGE_DIGEST}"
+DSYNCT_VERSION="${DSYNCT_VERSION}"
 DSYNCT_TAG="${DSYNCT_TAG}"
 DSYNCT_IMAGE_TAR="${DSYNCT_IMAGE_TAR}"
 TEMPORAL_IMAGE="${TEMPORAL_IMAGE}"
@@ -713,6 +971,7 @@ JQ_BIN="${JQ_BIN}"
 DOCKER_COMPOSE_VERSION="${DOCKER_COMPOSE_VERSION}"
 DOCKER_COMPOSE_BIN="${DOCKER_COMPOSE_BIN}"
 HELPER_TOOLS="fixIdTypes migrateIndexes checkChangeStreams copyMissingDocs fullCountVerify.sh"
+CDC_HELPERS="cs-rate-profile.js split-hot-cold.sh dsync-progress.sh dsync-find-pauses.sh"
 EOF
 
 log "generating SHA256 checksums"
@@ -738,6 +997,16 @@ log "packing ${BUNDLE}"
 tar -C "$STAGE" -czf "$BUNDLE" "$BUNDLE_NAME"
 ( cd "$OUTDIR" && "${SUM[@]}" "$(basename "$BUNDLE")" > "${BUNDLE}.sha256" )
 
+if [[ "$DSYNCT_MODE" == "binary" ]]; then
+  DSYNCT_NOTE="This bundle contains a LICENSED Enterprise dsynct binary. Treat it as
+confidential — do not publish it or commit it to a shared repository."
+else
+  DSYNCT_NOTE="dsynct came from ${DSYNCT_IMAGE} (${DSYNCT_IMAGE_DIGEST}), which Docker Hub
+labels \"trial\"; its LICENSE.md (payload/dsynct/LICENSE.md) is an evaluation
+licence. Confirm production licensing with Adiom before migrating with it, and
+do not publish this bundle."
+fi
+
 cat <<EOF
 
 Bundle ready:
@@ -745,8 +1014,7 @@ Bundle ready:
   ${BUNDLE}.sha256   ($(cut -d' ' -f1 < "${BUNDLE}.sha256"))
   size: $(du -h "$BUNDLE" | cut -f1)
 
-This bundle contains a LICENSED Enterprise dsynct binary. Treat it as
-confidential — do not publish it or commit it to a shared repository.
+${DSYNCT_NOTE}
 
 Transfer to the migration host, then:
   sha256sum -c $(basename "${BUNDLE}").sha256
