@@ -223,6 +223,9 @@ cp .env.sample .env
 #   NAMESPACE         = what to stream (see the table)
 #   WORKER_COUNT / CONCURRENT_ACTIVITIES / PER_STREAM_WORKERS = as planned for prod
 #   ATTEMPTS_BEFORE_PAUSE=3
+# If you edited .env on Windows, strip CRLF first, or every value gets a
+# trailing \r ("strconv.Atoi: parsing "3\r"") — same for compose/.env files:
+sed -i 's/\r$//' .env
 ```
 
 | Test | `NAMESPACE` | Stream mode | Destination | Expected | Proves |

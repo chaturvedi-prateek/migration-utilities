@@ -51,7 +51,17 @@ case "$TEST" in
 esac
 
 [[ -f "$ENV_FILE" ]] || die "${ENV_FILE} not found — cp .env.sample .env and fill it in"
+# Windows (CRLF) line endings leak "\r" into every value, so compose and
+# dsynct then reject e.g. "3\r" ("strconv.Atoi: parsing \"3\r\"").
+if grep -q $'\r' "$ENV_FILE"; then
+  die "${ENV_FILE} has Windows (CRLF) line endings — fix with: sed -i 's/\r\$//' ${ENV_FILE}"
+fi
 [[ -n "$(envget DOCDB_SRC "$ENV_FILE")" ]] || die "DOCDB_SRC is not set in ${ENV_FILE}"
+# dsynct picks the connector from the URI scheme; anything else (quotes,
+# leading space, placeholder) fails later as "unsupported source: missing or
+# unsupported connector" in a worker restart loop.
+[[ "$(envget DOCDB_SRC "$ENV_FILE")" =~ ^[\"\']?mongodb(\+srv)?:// ]] \
+  || die "DOCDB_SRC in ${ENV_FILE} must start with mongodb:// or mongodb+srv:// (no leading space) — copy the line from ../compose/.env"
 [[ -n "$(envget NAMESPACE "$ENV_FILE")" ]] || die "NAMESPACE is not set in ${ENV_FILE}"
 
 SCRATCH="$(envget SCRATCH_MDB_DEST "$ENV_FILE")"
