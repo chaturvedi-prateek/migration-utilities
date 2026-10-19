@@ -126,7 +126,7 @@ def iso: if . == null then "-" else todate end;
   (if ($b.streams | length) == 0 and $b.pending == 0 then "(no dsync_StreamChanges activity pending — initial sync still running, or flow not streaming)" else empty end)
 ' | column -t -s $'\t'
 
-PAUSED="$(jq -r '.activities[] | select(.paused or (.state | test("PAUSE")))
+PAUSED="$(jq -r '.activities[] | select(.paused or (.state | test("PAUSE"; "i")))
   | "  \(.type) activity-id=\(.id) state=\(.state) attempt=\(.attempt)\(if .failure then " failure=\(.failure)" else "" end)"' <<<"$S2")"
 if [[ -n "$PAUSED" ]]; then
   echo

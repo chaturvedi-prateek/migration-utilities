@@ -69,7 +69,7 @@ FOUND=0
 while read -r wf; do
   [[ -n "$wf" ]] || continue
   PAUSED="$(tcli workflow describe --workflow-id "$wf" -o json 2>/dev/null \
-    | jq -r '.pendingActivities[]? | select((.paused // false) or ((.state // "") | test("PAUSE")))
+    | jq -r '.pendingActivities[]? | select((.paused // false) or ((.state // "") | test("PAUSE"; "i")))
              | [.activityId, .activityType.name, .state, (.attempt // 0 | tostring),
                 (.lastFailure.message // "-")] | @tsv')" || continue
   [[ -n "$PAUSED" ]] || continue
