@@ -25,6 +25,9 @@ split, and the destination database drop. These commands use your existing
 set -euo pipefail
 C=/opt/docdb-migration/compose; P=~/cdc-plan
 cd "$C"
+# docker compose must parse the whole file; the runner needs STREAM_QUEUE,
+# which .env only gets in block 2. Supply it for this shell only.
+export STREAM_QUEUE=dsync-svoc-hot-streams
 B=.env.prod-svoc.bak
 [[ -f "$B" ]] || { echo "STOP: $C/$B missing"; exit 1; }
 
@@ -54,8 +57,9 @@ fi
 echo "coverage OK: hot + cold$([[ ${#EXCL[@]} -gt 0 ]] && echo ' + exclude') = all $(wc -l < "$P/all-now.txt") source collections"
 
 # 1c. Temporal healthy, prod-svoc not Running, new IDs unused
-docker compose exec -T temporal temporal operator cluster health </dev/null >/dev/null \
-  || { echo "STOP: Temporal is not healthy"; exit 1; }
+if ! HL="$(docker compose exec -T temporal temporal operator cluster health </dev/null 2>&1)"; then
+  echo "$HL"; echo "STOP: cannot reach Temporal (error above). Check: docker compose ps temporal"; exit 1
+fi
 OUT="$(docker compose exec -T temporal temporal workflow list --query "WorkflowId='prod-svoc' AND ExecutionStatus='Running'" </dev/null)"
 if grep -q prod-svoc <<<"$OUT"; then echo "STOP: prod-svoc is still Running. Run block 1R, then this block again"; exit 1; fi
 for wf in svoc-hot svoc-cold; do
@@ -94,6 +98,7 @@ echo "ALL CHECKS PASSED. Next: block 2"
 (
 set -euo pipefail
 cd /opt/docdb-migration/compose
+export STREAM_QUEUE=dsync-svoc-hot-streams   # see block 1
 docker compose exec -T temporal temporal workflow describe --workflow-id prod-svoc </dev/null > ~/cdc-plan/prod-svoc-final.txt || true
 docker compose exec -T temporal temporal workflow terminate --workflow-id prod-svoc \
   --reason "re-baseline: hot/cold per-namespace streams" </dev/null
