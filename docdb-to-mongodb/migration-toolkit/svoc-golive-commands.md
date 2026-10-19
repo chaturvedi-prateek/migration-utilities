@@ -11,7 +11,7 @@ split, and the destination database drop. These commands use your existing
 
 | Item | Value |
 |---|---|
-| Hot flow | `svoc-hot`: per-namespace streams. 3 worker containers: stream pool 2 × 32 slots (64 ≥ 2 × 30 streams), sync pool 1 × 12 |
+| Hot flow | `svoc-hot`: per-namespace streams. stream pool 2 workers × 32 slots (64 ≥ 2 × 30 streams), initial-sync pool 3 workers × 4 slots |
 | Cold flow | `svoc-cold`: one shared stream. 1 worker container × 10 slots (2 stream + 8 initial sync) |
 | Dashboards | hot `:8081`; cold `127.0.0.1:8083` (`ssh -L 8083:localhost:8083 <host>`) |
 | Pristine prod config | `compose/.env.prod-svoc.bak` (every env file is rebuilt from it) |
@@ -147,7 +147,7 @@ setenv() {   # setenv FILE KEY=VALUE ...  (replace or append each key)
 
 # hot flow: runner + initial-sync pool (main project "compose")
 setenv .env WORKFLOW_ID=svoc-hot QUEUE=dsync-svoc-hot-sync STREAM_QUEUE=dsync-svoc-hot-streams \
-  "NAMESPACE=$HOT" PER_NAMESPACE_STREAMS=true CONCURRENT_ACTIVITIES=12 PER_STREAM_WORKERS=4 \
+  "NAMESPACE=$HOT" PER_NAMESPACE_STREAMS=true CONCURRENT_ACTIVITIES=4 PER_STREAM_WORKERS=4 \
   ATTEMPTS_BEFORE_PAUSE=3 SKIP_INITIAL_SYNC=false DASHBOARD_PORT=8081 TEMPORAL_ADDR=temporal:7233
 
 # hot stream pool: workers only (project "hot-streams")
@@ -176,7 +176,7 @@ echo "ENV OK. Next: block 3"
 )
 ```
 
-Expected: `CONCURRENT_ACTIVITIES` is 12 in `.env`, 32 in `.env.hot-streams` and 10 in
+Expected: `CONCURRENT_ACTIVITIES` is 4 in `.env`, 32 in `.env.hot-streams` and 10 in
 `.env.cold`. `.env` and `.env.hot-streams` have the hot count (30), `.env.cold` has
 the cold count, and all three files are mode `600`. Never `cat` these files:
 they contain passwords.
@@ -202,7 +202,7 @@ mongosh "$DEST" --quiet --eval "const w=[${DBS},'adiom-internal'];
   if (w.some(d=>h.has(d))) quit(2);" </dev/null || { echo "STOP: destination not empty or unreachable"; exit 1; }
 
 docker compose -p hot-streams --env-file .env.hot-streams up -d --no-deps --scale worker=2 worker   # hot stream pool: 2 x 32 slots
-docker compose up -d --no-deps --force-recreate --scale worker=1 worker                              # hot sync pool: 1 x 12 slots
+docker compose up -d --no-deps --force-recreate --scale worker=3 worker                              # hot sync pool: 3 x 4 slots
 docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=1 worker            # cold pool: 1 x 10 slots
 sleep 10
 docker compose up -d --no-deps --force-recreate runner                                              # starts svoc-hot
@@ -254,7 +254,7 @@ Every few hours, rerun the commands in block 4.
 - **Scale a sync pool:** for hot, run `docker compose up -d --no-deps --scale worker=N worker`.
   For cold, run `docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=N worker`.
   Keep the hot stream pool at 2 workers × 32 slots or more: it needs 2 slots per hot collection (60).
-  Adding sync workers adds slots (12 each hot, 10 each cold) and raises load on the source replica and Atlas.
+  Adding sync workers adds slots (4 each hot, 10 each cold) and raises load on the source replica and Atlas.
 - **Healthy CDC:** lag stays bounded across a peak window. Judge the trend over hours, not a single sample.
 - **No new collections on the source until cutover.** A new collection gets no stream, so its writes are skipped.
 
