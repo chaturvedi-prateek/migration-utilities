@@ -350,10 +350,14 @@ sort -u hot.txt cold.txt | diff - <(sort -u all.txt)        # only deliberate ex
   - The generated compose has one worker service, so run the second pool as
     its own compose project, like flow B in §5.3 (`.env` with only `QUEUE`
     changed, `--no-deps worker`). Add the two flags to the runner's `run` leg.
-  - Confirm the flag names first with
-    `docker run --rm dsynct:enterprise run --help | grep -i queue-name`, and
-    ask Adiom whether StreamLSN also runs on the stream pool and holds its
-    slots during the whole initial sync.
+  - Both are `run` options, verified on `markadiom/dsynct:latest`
+    (2026-10). `--stream-queue-name`: "use this queue name for streaming
+    activities instead of queue-name". `--initial-sync-queue-name`: "use
+    this queue name for initial sync tasks instead of queue-name". Each
+    falls back to `--queue-name` when unset. Workers only take `--queue-name`,
+    so each pool's workers set it to that pool's queue. Still ask Adiom
+    whether StreamLSN also runs on the stream pool and holds its slots during
+    the whole initial sync.
   - Once the initial sync finishes, scale the sync pool to 0. The stream pool
     keeps running.
 - Initial sync behaves as before (scale workers live, runbook §6). CDC needs
@@ -475,9 +479,9 @@ destination configuration can redirect writes. No known DocumentDB-destination
 limits.
 
 Still open:
-- Exact usage of `--stream-queue-name` / `--initial-sync-queue-name`: whether
-  StreamLSN runs on the stream pool, and whether stream activities hold slots
-  during the whole initial sync.
+- `--stream-queue-name` / `--initial-sync-queue-name` exist on `run` (verified).
+  Still open: does StreamLSN run on the stream pool, and do stream activities
+  hold slots during the whole initial sync?
 - For a collection created mid-run: are its events skipped or applied on a
   shared database-level stream? Is a separate non-overlapping flow the right
   remedy?

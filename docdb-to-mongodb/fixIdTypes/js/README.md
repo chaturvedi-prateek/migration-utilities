@@ -180,7 +180,7 @@ Three-phase batch operation. No upfront count queries — streams and processes 
 
 ### Configuration
 
-Open `fixIdTypes.js` and update `COLLECTIONS`. The script is pre-configured for two known MSIL collections:
+Open `fixIdTypes.js` and update `COLLECTIONS`. The script is pre-configured for two known customer collections:
 
 ```javascript
 const COLLECTIONS = [
