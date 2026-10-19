@@ -465,7 +465,7 @@ dsync-find-pauses.sh --workflow-id <name>-cold
 | §7 Verification | **Yes, per flow** | §T8 memory caveats apply; `sample-ids`/`verify-ids` for large collections |
 | §7.5 Empty collections | **Yes** | Run after both flows are in CDC |
 | §8 Indexes | **Yes** | Once **both** flows' CDC lag is ~0, before cutover |
-| §9 Cutover | **Yes, both flows** | Drain **both** to `EventsRead == EventsWritten` and lag 0 before stopping either |
+| §9 Cutover | **Yes, both flows** | Drain **both** (§7.5: `gap` 0, `lsn-read` ≤ 0, counters unchanged) before stopping either |
 | §10 Reverse CDC | **Yes, but split it the same way** | See §8 below: a single shared reverse stream would hit the same ~2k/s ceiling |
 | §T1 CDC tuning | Superseded by §0 here | Writer knobs don't fix a shared multi-namespace stream |
 | §T2 Pauses | Yes | `ATTEMPTS_BEFORE_PAUSE=3`; use `dsync-find-pauses.sh`; `--reset-attempts` |
@@ -491,12 +491,219 @@ docker stats --no-stream
 | Initial sync | `bulk-N` completing; Pending Child Workflows falling; worker CPU busy | progress stalls with 0 ops/s, so run `dsync-find-pauses.sh` **first** |
 | CDC catch-up | catch-up ratio > 1 per stream; lag shrinking; gap not pinned at the buffer size | ratio < 1 on a cold-flow stream (cold set too busy) or on a single hot stream (one namespace too hot): escalate |
 | Steady CDC | lag ~0, `LastEventTime` ≈ now | lag creeping up at peak hours |
-| Ready for cutover | both flows: `EventsRead == EventsWritten`, lag 0 after source writes stop | — |
+| Ready for cutover | after source writes stop, both flows: `gap` 0, `lsn-read` ≤ 0, counters unchanged across two samples (§7.5) | — |
 
 Note the rough timeline: the initial sync (~1.5 days for ~36 TB in the
 production case), then catching up on the changes accumulated during it.
 With the hot/cold split the catch-up should run several times faster than the
 source rate. Track it with the catch-up ratio.
+
+The debugging blocks in §7.1–§7.5 use the layout from §5: hot flow in the main
+`compose` project (`.env`), the hot stream pool in project `hot-streams`
+(`.env.hot-streams`), the cold flow in project `flow-cold` (`.env.cold`). They
+are read-only unless a step says otherwise. Each runs in a `( ... )` subshell,
+so an error returns you to the prompt instead of closing the SSH session.
+Replace `<name>` with your flow name and `/opt/docdb-migration` with your
+toolkit prefix.
+
+### 7.1 Command pitfalls with several compose projects
+
+- **`docker compose ps` shows one project only.** From `<prefix>/compose` it
+  lists the main project (temporal, hot runner, hot sync workers). Add
+  `-p hot-streams --env-file .env.hot-streams` or `-p flow-cold --env-file .env.cold`
+  for the other pools. `docker ps` shows every container. To see them grouped:
+  `docker ps --format 'table {{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Status}}' | sort`.
+  `logs`, `up --scale` and `stop` are scoped the same way.
+- **`required variable STREAM_QUEUE is missing a value`.** Every
+  `docker compose` command, even `exec temporal`, interpolates the whole
+  compose file, and the runner needs `${STREAM_QUEUE:?...}`. Until `.env`
+  has `STREAM_QUEUE`, set it only inside a subshell:
+  `( export STREAM_QUEUE=dsync-<name>-hot-streams; docker compose exec -T temporal ... )`.
+- **Never export `STREAM_QUEUE`, `QUEUE`, `WORKFLOW_ID` or `NAMESPACE` in
+  your login shell.** Shell variables override `--env-file`, so the cold
+  runner would start with the hot queue names and its stream would land on
+  the hot workers. Start blocks that bring up services with
+  `unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE`.
+- **Windows (CRLF) line endings also hit backups.** Read values with
+  `tr -d '\r' < .env.prod.bak | grep '^MDB_DEST='`, not a bare `grep`, or the
+  URI ends in `\r`.
+
+### 7.2 Check progress per flow
+
+**Dashboards.** Only one port may be open in the security group. Bind the
+second runner to loopback (`DASHBOARD_PORT=127.0.0.1:8083`) and tunnel to it:
+`ssh -L 8083:localhost:8083 <user>@<host>`, then open `http://localhost:8083`.
+With SSM:
+`aws ssm start-session --target <instance-id> --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["8083"],"localPortNumber":["8083"]}'`.
+On the host, `curl -sI http://127.0.0.1:8083 | head -n1` must return HTTP 200.
+
+**Copy partitions.** Each `bulk-N` child copies one partition. `Running`
+includes the flow itself, so subtract 1. `Failed` must stay 0.
+
+```bash
+(
+cd /opt/docdb-migration/compose     # <prefix>/compose
+for s in Running Completed Failed; do
+  printf '%-10s ' "$s"; docker compose exec -T temporal temporal workflow count \
+    --query "RootWorkflowId='<name>-cold' AND ExecutionStatus='$s'" </dev/null
+done
+)
+```
+
+**Documents copied per collection, source vs destination.** The block calls
+`estimatedDocumentCount()`, which reads collection metadata (no scan), so it
+is cheap on both sides. Use it to compute the real copy rate per flow:
+Δ(destination total) ÷ Δ(time) between two runs, an hour apart. Set `L` to
+the flow's list file (`cold.txt` or `hot.txt`).
+
+```bash
+(
+set -euo pipefail
+unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE
+export LC_ALL=C
+cd /opt/docdb-migration/compose; P=~/cdc-plan; L="$P/cold.txt"
+SRC="$(tr -d '\r' < .env.cold | grep '^DOCDB_SRC=' | tail -n1 | cut -d= -f2- | sed 's|tlsCAFile=/certs/|tlsCAFile=/opt/docdb-migration/certs/|')"
+DEST="$(tr -d '\r' < .env.cold | grep '^MDB_DEST=' | tail -n1 | cut -d= -f2-)"
+NS="$(sed 's/.*/"&"/' "$L" | paste -sd, -)"
+JS="[${NS}].forEach(n=>{const i=n.indexOf('.'); print(n+' '+db.getSiblingDB(n.slice(0,i)).getCollection(n.slice(i+1)).estimatedDocumentCount());})"
+mongosh "$SRC"  --quiet --eval "$JS" </dev/null | tr -d '\r' | sort > "$P/counts-src.txt"
+mongosh "$DEST" --quiet --eval "$JS" </dev/null | tr -d '\r' | sort > "$P/counts-dst.txt"
+join "$P/counts-src.txt" "$P/counts-dst.txt" > "$P/counts.txt"
+printf '%-58s %14s %14s %7s\n' NAMESPACE SOURCE DESTINATION COPIED
+awk '{p=($2>0)?100*$3/$2:100; printf "%-58s %14d %14d %6.1f%%\n",$1,$2,$3,p}' "$P/counts.txt" | sort -k4,4n
+awk '{s+=$2; d+=$3; if ($2>0 && $3>=$2) done++} END {printf "TOTAL %d/%d collections complete; %d of %d docs (%.1f%%)\n", done, NR, d, s, (s>0)?100*d/s:100}' "$P/counts.txt"
+)
+```
+
+The source keeps changing, so 100% is an estimate, not "done". The initial
+sync is done when no `bulk-N` child is running. 0% on some collections early
+on is normal, because partitions are copied in batches.
+
+### 7.3 One flow copies, the other stays at 0%
+
+Possible causes: it is still **planning** (large collections take longer), its
+copy tasks are **paused** after a worker recreate, its sync workers are **not
+polling**, or its **slots are full**. Every StreamLSN holds a slot from the
+start and never finishes. Adiom says stream activities go to the
+`--stream-queue-name` pool (§0 rule 6), but check: if StreamLSN runs on the
+*sync* pool, N per-namespace streams fill N sync slots, and copying cannot
+start until N is exceeded. This read-only block tells the causes apart:
+
+```bash
+(
+set -uo pipefail
+unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE
+cd /opt/docdb-migration/compose; WF="<name>-hot"
+tc() { docker compose exec -T temporal temporal "$@" </dev/null; }
+echo "== containers (container ID = the worker identity Temporal shows)"
+docker ps --format '{{.ID}}  {{.Names}}  {{.Status}}' | grep -E 'worker|runner'
+echo "== $WF root: pending activities by type / state / worker"
+tc workflow describe --workflow-id "$WF" -o json \
+  | jq -r '.pendingActivities[]? | "\(.activityType.name)  \(.state)  worker=\(.lastWorkerIdentity // "none")"' \
+  | sort | uniq -c
+echo "== copy partitions"
+for s in Running Completed Failed; do printf '%-10s ' "$s"; tc workflow count --query "RootWorkflowId='$WF' AND ExecutionStatus='$s'"; done
+echo "== pollers"
+for q in "dsync-<name>-hot-sync" "dsync-<name>-hot-streams"; do
+  echo "-- $q"
+  tc task-queue describe --task-queue "$q" --task-queue-type activity 2>/dev/null || tc task-queue describe --task-queue "$q"
+done
+echo "== pauses"; /opt/docdb-migration/helpers/dsync-find-pauses.sh --compose-dir "$PWD" --workflow-id "$WF"
+echo "== logs"; docker compose logs --tail=15 runner 2>&1 | tail -n 15; docker compose logs --tail=15 worker 2>&1 | tail -n 45
+)
+```
+
+| Output | Cause | Fix |
+|---|---|---|
+| Many `dsync_StreamLSN … STARTED` with `worker=1@<ID>@`, where `<ID>` is a **sync-pool** container; the rest `SCHEDULED`; no children | StreamLSN fills the sync slots | Sync pool `CONCURRENT_ACTIVITIES` = ⌈(streams + wanted copy tasks) ÷ workers⌉, e.g. 30 streams + 12 copy on 3 workers = **14**. Edit `.env`, then `docker compose up -d --no-deps --scale worker=3 worker` |
+| StreamLSN on **stream-pool** containers, one planning/sampling activity `STARTED` with a recent heartbeat, 0 children | Still planning | Wait; re-check in 15–30 min |
+| Paused activities | Paused after restarts | Fix the cause, then `dsync-find-pauses.sh … --unpause` (`--reset-attempts` only) |
+| No pollers on the sync queue, or workers restarting | Workers not connected | Read the worker logs (wrong `QUEUE`, CRLF, bad URI scheme) |
+
+Do not change slots until the output confirms the cause. Each recreate costs
+an attempt on every running task (§7.5).
+
+### 7.4 Initial sync slower than expected
+
+First find the limit; more workers only help when nothing else is saturated.
+Compare runs by **MB/s, not docs/s**: a flow of large documents shows fewer
+docs/s at the same MB/s. A sharp drop in per-task rate (MB/s ÷ started copy
+tasks) compared with an earlier run points at the source or the destination,
+not at concurrency.
+
+```bash
+(
+set -uo pipefail
+unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE
+cd /opt/docdb-migration/compose
+tc() { docker compose exec -T temporal temporal "$@" </dev/null; }
+grep '^CONCURRENT_ACTIVITIES=\|^SYNC_WRITER_WORKERS=' .env .env.cold
+for wf in "<name>-hot" "<name>-cold"; do
+  ids="$( { tc workflow list -o json --query "RootWorkflowId='$wf' AND ExecutionStatus='Running'" | jq -r '.[]?.execution.workflowId // empty'
+            tc workflow describe --workflow-id "$wf" -o json | jq -r '.pendingChildren[]?.workflowId // empty'; } | sort -u | grep -v "^$wf\$" )"
+  printf '== %s copy tasks: ' "$wf"
+  for id in $ids; do
+    tc workflow describe --workflow-id "$id" -o json | jq -r '.pendingActivities[]? | select(.activityType.name=="dsync_InitialSync") | .state'
+  done | sort | uniq -c | tr '\n' ' '; echo
+done
+mb() { awk '{v=$1; u=$2; f=1; if(u~/^kB/)f=1e-3; else if(u~/^MB/)f=1; else if(u~/^GB/)f=1e3; else if(u~/^TB/)f=1e6; else if(u~/^B/)f=1e-6; printf "%.3f", v*f}'; }
+snap() { docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.NetIO}}' | grep worker \
+         | sed -E 's/([0-9.]+)([kMGT]?B) \/ .*/\1 \2/'; }
+A="$(snap)"; sleep 30; B="$(snap)"
+echo "== worker    CPU    net-in MB/s (30 s)"
+while read -r n c v u; do
+  b1="$(echo "$v $u" | mb)"; line="$(grep "^$n " <<<"$A")"; set -- $line
+  b0="$(echo "$3 $4" | mb)"
+  awk -v n="$n" -v c="$c" -v a="$b0" -v b="$b1" 'BEGIN{printf "%-28s %7s %8.1f\n", n, c, (b-a)/30}'
+done <<<"$B"
+)
+```
+
+While it runs, also read the source **replica** CPU (CloudWatch, per
+instance), Atlas CPU, and Atlas disk IOPS and write latency.
+
+| What you see | Limit | Change (one at a time) |
+|---|---|---|
+| Many copy tasks `SCHEDULED` | Slots | **A.** Raise the sync pool's `CONCURRENT_ACTIVITIES`, leaving room for any StreamLSN on that pool (§7.3) |
+| All `STARTED`; workers, replica and Atlas under ~60% | Copy concurrency | **A**, then **B** |
+| All `STARTED`, worker CPU and net-in low, Atlas write latency low | Writes per task | **B.** `SYNC_WRITER_WORKERS` 8 → 16 in the pool's env file (compose default 8) |
+| Replica CPU > ~70% | Source reads, shared by every flow | **C.** Lower the less urgent flow's `CONCURRENT_ACTIVITIES`, so the flow with the largest collections (it sets the cutover date) gets the replica. Raise it back later. Keep 2 slots per stream it hosts |
+| Atlas CPU or disk IOPS maxed | Destination | Don't add load. Check Atlas disk/IOPS throttling first |
+
+Apply a change by editing the pool's env file and recreating only that pool's
+workers, for example:
+
+```bash
+(
+set -euo pipefail; unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE
+cd /opt/docdb-migration/compose
+sed -i 's/^CONCURRENT_ACTIVITIES=.*/CONCURRENT_ACTIVITIES=18/' .env; chmod 600 .env
+docker compose up -d --no-deps --scale worker=3 worker              # hot sync pool only
+# cold: edit .env.cold, then: docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=1 worker
+)
+```
+
+`--no-deps` with only `worker` named leaves the runner, Temporal and the other
+projects untouched. Wait ~20 minutes, then measure again.
+
+### 7.5 Rules while tuning, and the drained state
+
+- **Recreating workers pauses tasks after enough restarts.** A recreate counts
+  as one failed attempt on every task it interrupts, and
+  `ATTEMPTS_BEFORE_PAUSE=3` pauses a task after the third. Run
+  `dsync-find-pauses.sh` for both flows ~5 minutes after each change. Never
+  stack several recreates in a row.
+- **Only adding workers needs no recreate.** `--scale worker=N` with an
+  unchanged env file starts the extra containers alone.
+- **The stream pool doesn't speed up the copy.** It only runs streams; size
+  it at ≥ 2 slots per stream it hosts.
+- **Drained, after source writes stop.** Take two samples:
+  `dsync-progress.sh --workflow-id <wf> --interval 30`. Every row of both
+  flows needs `gap` = 0, `lsn-read` ≤ 0 (negative = the LSN heartbeat trails;
+  positive = unread backlog), `w/s` = 0 with unchanged counters, no paused
+  activities, and the expected number of rows (one per hot stream, one for
+  cold). `lag_s` keeps growing on a fully drained stream once writes stop, so
+  it is not a readiness signal then.
 
 ---
 
@@ -504,10 +711,10 @@ source rate. Track it with the catch-up ratio.
 
 - **Before cutover:** re-check for collections created on the source since §5.3
   (neither flow carries them, and DDL is not replicated). Run runbook §7.5,
-  then §8 indexes once both flows are at lag 0.
-- **Cutover (runbook §9):** stop source writes → wait until **both** flows show
-  `EventsRead == EventsWritten` and lag 0 → verify → terminate **both**
-  workflows.
+  then §8 indexes once both flows are at lag ~0 (while writes still flow).
+- **Cutover (runbook §9):** stop source writes → wait until **both** flows are
+  drained as defined in §7.5 (`gap` 0, `lsn-read` ≤ 0, counters unchanged
+  across two samples, no pauses) → verify → terminate **both** workflows.
 - **Reverse CDC (runbook §10):** after cutover the application writes to Atlas
   at the same rate, so a single shared reverse stream would hit the same
   ceiling. Mirror the forward topology: a reverse-hot flow with
