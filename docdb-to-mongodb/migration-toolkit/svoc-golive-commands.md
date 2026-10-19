@@ -11,8 +11,8 @@ split, and the destination database drop. These commands use your existing
 
 | Item | Value |
 |---|---|
-| Hot flow | `svoc-hot`: per-namespace streams. Stream pool 4 workers × 20 slots, sync pool 3 × 4 |
-| Cold flow | `svoc-cold`: one shared stream, pool 2 × 5 |
+| Hot flow | `svoc-hot`: per-namespace streams. 3 worker containers: stream pool 2 × 32 slots (64 ≥ 2 × 30 streams), sync pool 1 × 12 |
+| Cold flow | `svoc-cold`: one shared stream. 1 worker container × 10 slots (2 stream + 8 initial sync) |
 | Dashboards | hot `:8081`; cold `127.0.0.1:8083` (`ssh -L 8083:localhost:8083 <host>`) |
 | Pristine prod config | `compose/.env.prod-svoc.bak` (every env file is rebuilt from it) |
 
@@ -122,6 +122,7 @@ docker compose stop runner worker
 ```bash
 (
 set -euo pipefail
+unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE   # env files must win, not your shell
 cd /opt/docdb-migration/compose; P=~/cdc-plan
 umask 077
 WF="$(tr -d '\r' < .env.prod-svoc.bak | grep '^WORKFLOW_ID=' | tail -n1)"
@@ -146,23 +147,24 @@ setenv() {   # setenv FILE KEY=VALUE ...  (replace or append each key)
 
 # hot flow: runner + initial-sync pool (main project "compose")
 setenv .env WORKFLOW_ID=svoc-hot QUEUE=dsync-svoc-hot-sync STREAM_QUEUE=dsync-svoc-hot-streams \
-  "NAMESPACE=$HOT" PER_NAMESPACE_STREAMS=true CONCURRENT_ACTIVITIES=4 PER_STREAM_WORKERS=4 \
+  "NAMESPACE=$HOT" PER_NAMESPACE_STREAMS=true CONCURRENT_ACTIVITIES=12 PER_STREAM_WORKERS=4 \
   ATTEMPTS_BEFORE_PAUSE=3 SKIP_INITIAL_SYNC=false DASHBOARD_PORT=8081 TEMPORAL_ADDR=temporal:7233
 
 # hot stream pool: workers only (project "hot-streams")
 command cp -f .env .env.hot-streams
-setenv .env.hot-streams QUEUE=dsync-svoc-hot-streams CONCURRENT_ACTIVITIES=20 TEMPORAL_ADDR=host.docker.internal:7233
+setenv .env.hot-streams QUEUE=dsync-svoc-hot-streams CONCURRENT_ACTIVITIES=32 TEMPORAL_ADDR=host.docker.internal:7233
 
 # cold flow: runner + its pool (project "flow-cold")
 command cp -f .env .env.cold
 setenv .env.cold WORKFLOW_ID=svoc-cold QUEUE=dsync-svoc-cold STREAM_QUEUE=dsync-svoc-cold \
-  "NAMESPACE=$COLD" PER_NAMESPACE_STREAMS=false CONCURRENT_ACTIVITIES=5 \
+  "NAMESPACE=$COLD" PER_NAMESPACE_STREAMS=false CONCURRENT_ACTIVITIES=10 \
   TEMPORAL_ADDR=host.docker.internal:7233 DASHBOARD_PORT=127.0.0.1:8083
 
 chmod 600 .env .env.hot-streams .env.cold .env.prod-svoc.bak
 n() { grep '^NAMESPACE=' "$1" | tail -n1 | cut -d= -f2- | tr ',' '\n' | grep -c .; }
 [[ "$(n .env)" -eq "$HN" && "$(n .env.hot-streams)" -eq "$HN" && "$(n .env.cold)" -eq "$CN" ]] \
   || { echo "STOP: NAMESPACE counts do not match hot=$HN / cold=$CN"; exit 1; }
+(( 2 * 32 >= 2 * HN )) || { echo "STOP: 2 stream workers x 32 slots < 2 x $HN hot streams"; exit 1; }
 for f in .env .env.hot-streams .env.cold; do
   echo "== $f  (NAMESPACE entries: $(n "$f"), mode $(stat -c %a "$f"))"
   grep -E '^(WORKFLOW_ID|QUEUE|STREAM_QUEUE|PER_NAMESPACE_STREAMS|CONCURRENT_ACTIVITIES|TEMPORAL_ADDR|DASHBOARD_PORT|SKIP_INITIAL_SYNC)=' "$f"
@@ -174,7 +176,8 @@ echo "ENV OK. Next: block 3"
 )
 ```
 
-Expected: `.env` and `.env.hot-streams` have the hot count (30), `.env.cold` has
+Expected: `CONCURRENT_ACTIVITIES` is 12 in `.env`, 32 in `.env.hot-streams` and 10 in
+`.env.cold`. `.env` and `.env.hot-streams` have the hot count (30), `.env.cold` has
 the cold count, and all three files are mode `600`. Never `cat` these files:
 they contain passwords.
 
@@ -188,6 +191,7 @@ could have changed since then before starting anything.
 ```bash
 (
 set -euo pipefail
+unset STREAM_QUEUE QUEUE WORKFLOW_ID NAMESPACE   # env files must win, not your shell
 cd /opt/docdb-migration/compose; P=~/cdc-plan
 OUT="$(docker compose exec -T temporal temporal workflow list --query "WorkflowId='prod-svoc' AND ExecutionStatus='Running'" </dev/null)"
 if grep -q prod-svoc <<<"$OUT"; then echo "STOP: prod-svoc is Running"; exit 1; fi
@@ -197,9 +201,9 @@ mongosh "$DEST" --quiet --eval "const w=[${DBS},'adiom-internal'];
   const h=new Set(db.adminCommand({listDatabases:1,nameOnly:true}).databases.map(x=>x.name));
   if (w.some(d=>h.has(d))) quit(2);" </dev/null || { echo "STOP: destination not empty or unreachable"; exit 1; }
 
-docker compose -p hot-streams --env-file .env.hot-streams up -d --no-deps --scale worker=4 worker   # hot stream pool
-docker compose up -d --no-deps --force-recreate --scale worker=3 worker                              # hot sync pool
-docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=2 worker            # cold pool
+docker compose -p hot-streams --env-file .env.hot-streams up -d --no-deps --scale worker=2 worker   # hot stream pool: 2 x 32 slots
+docker compose up -d --no-deps --force-recreate --scale worker=1 worker                              # hot sync pool: 1 x 12 slots
+docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=1 worker            # cold pool: 1 x 10 slots
 sleep 10
 docker compose up -d --no-deps --force-recreate runner                                              # starts svoc-hot
 docker compose -p flow-cold --env-file .env.cold up -d --no-deps runner                             # starts svoc-cold
@@ -249,7 +253,8 @@ Every few hours, rerun the commands in block 4.
   Use `up -d --force-recreate`, never `restart`.
 - **Scale a sync pool:** for hot, run `docker compose up -d --no-deps --scale worker=N worker`.
   For cold, run `docker compose -p flow-cold --env-file .env.cold up -d --no-deps --scale worker=N worker`.
-  Keep the hot stream pool at 4 or more (it needs at least 2 slots per hot collection).
+  Keep the hot stream pool at 2 workers × 32 slots or more: it needs 2 slots per hot collection (60).
+  Adding sync workers adds slots (12 each hot, 10 each cold) and raises load on the source replica and Atlas.
 - **Healthy CDC:** lag stays bounded across a peak window. Judge the trend over hours, not a single sample.
 - **No new collections on the source until cutover.** A new collection gets no stream, so its writes are skipped.
 
