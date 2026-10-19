@@ -221,3 +221,4 @@ cosmosdb-to-mongodb/**/assessment/
 docdb-to-mongodb/migration-toolkit/internal/
 docdb-to-mongodb/migration-toolkit/Screenshot*.png
 docdb-to-mongodb/migration-toolkit/response.md
+.worktrees/
