@@ -201,6 +201,15 @@ not in the repo's `helpers/cdctest/`), so use the installed copy at
 `<prefix>/cdctest`. To add networks or port remaps, put them in
 `<prefix>/cdctest/docker-compose.override.yml`; `run-cdc-test.sh` loads it.
 
+**Temporal volume permissions.** `temporalio/temporal` runs as a non-root
+user, but Docker creates the named volume owned by root. Temporal then
+restart-loops with `unable to open database file: out of memory (14)`, which
+is SQLite's CANTOPEN error, not memory. The test project's volume is
+`cdctest_temporal-data`, **not** `compose_temporal-data` (the runbook §4 fix
+targets the main project). `run-cdc-test.sh` fixes this itself on every start
+(it needs `sudo` on Docker hosts). If you start the project by hand:
+`docker compose down && sudo chmod 777 /var/lib/docker/volumes/cdctest_temporal-data/_data && docker compose up -d temporal`.
+
 All tests run in their own compose project (`cdctest`) with their own Temporal
 (host ports 17233 / 18233, dashboard 8082), `SKIP_INITIAL_SYNC` forced on.
 Each test starts reading **from now**, so "keeps up" simply means the lag

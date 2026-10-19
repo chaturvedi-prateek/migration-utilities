@@ -85,6 +85,20 @@ fi
 printf 'CDC_TEST=%s\n' "$TEST" > "${HERE}/.active"
 
 log "starting ${TEST}: dest=$([[ "$TEST" == T0 ]] && echo /dev/null || echo "scratch ($(hosts "$SCRATCH"))") per-namespace-streams=${PER_NAMESPACE_STREAMS}"
+# temporalio/temporal runs as a non-root user, but Docker creates the named
+# volume root-owned, so SQLite fails with "unable to open database file: out of
+# memory (14)" (SQLITE_CANTOPEN). `down -v` above deletes the volume, so fix
+# the ownership on every start: create the container+volume, open up the
+# mountpoint, then start.
+compose create temporal >/dev/null
+VOL="cdctest_temporal-data"
+MP="$(docker volume inspect -f '{{.Mountpoint}}' "$VOL" 2>/dev/null || true)"
+if [[ -n "$MP" ]]; then
+  chmod 777 "$MP" 2>/dev/null || sudo chmod 777 "$MP" \
+    || die "cannot chmod ${MP}; run: sudo chmod 777 ${MP}"
+else
+  log "volume ${VOL} not found — if temporal restarts with SQLite error 14, chmod its mountpoint (runbook §4)"
+fi
 compose up -d temporal
 for _ in $(seq 1 30); do
   compose exec -T temporal temporal operator cluster health </dev/null >/dev/null 2>&1 && break
