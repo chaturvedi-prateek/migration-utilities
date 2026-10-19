@@ -326,7 +326,9 @@ dsync-progress.sh --workflow-id <wf> --interval 60
 
 # paused activities anywhere in the workflow tree (child workflows included)
 dsync-find-pauses.sh --workflow-id <wf>            # report
-dsync-find-pauses.sh --workflow-id <wf> --unpause  # unpause with --reset-attempts
+dsync-find-pauses.sh --workflow-id <wf> --unpause  # unpause with --reset-attempts (never --reset-heartbeats)
+# Adiom's built-in alternative (check --help for the Temporal address first):
+#   docker run --rm -e DSYNCT_MODE=temporaltools dsynct:enterprise unpause --workflow-id=<wf> --dry-run
 
 # stream-only throughput tests on a SCRATCH destination (refuses prod MDB_DEST)
 cd <prefix>/cdctest && cp .env.sample .env && ./run-cdc-test.sh T0|T1|T2|status|down
