@@ -3,7 +3,7 @@
 # dsync-find-pauses.sh — find (and optionally unpause) paused dsynct activities
 # across a flow's workflow tree.
 #
-#   dsync-find-pauses.sh [--workflow-id ID] [--compose-dir DIR] [--unpause [--keep-heartbeats]]
+#   dsync-find-pauses.sh [--workflow-id ID] [--compose-dir DIR] [--unpause [--reset-heartbeats]]
 #
 # A paused activity only shows in `temporal workflow describe` of the CHILD
 # workflow that owns it (e.g. <wf>/bulk-5), not on the parent, and
@@ -11,9 +11,11 @@
 # find it. This walks every running workflow with RootWorkflowId=<ID> (plus the
 # parent's pendingChildren), describes each, and reports activities in
 # PauseRequested/Paused. --unpause runs, for each one:
-#   temporal activity unpause --workflow-id <wf> --activity-id <id> \
-#     --reset-attempts --reset-heartbeats
-# --keep-heartbeats drops --reset-heartbeats (keeps the stored heartbeat).
+#   temporal activity unpause --workflow-id <wf> --activity-id <id> --reset-attempts
+# so the activity resumes from its last heartbeat (CDC cursor / sync progress).
+# --reset-heartbeats additionally discards the heartbeat: per Adiom the activity
+# then restarts from its ORIGINAL cursor (a CDC stream replays from the start of
+# the run; an initial-sync partition is re-copied). Avoid it unless Adiom asks.
 #
 # Defaults as dsync-progress.sh: --compose-dir $COMPOSE_DIR or
 # <toolkit>/compose, workflow id from $WORKFLOW_ID or <compose-dir>/.env.
@@ -24,9 +26,9 @@ WORKFLOW_ID="${WORKFLOW_ID:-}"
 SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 COMPOSE_DIR="${COMPOSE_DIR:-${SELF_DIR}/../compose}"
 UNPAUSE="false"
-RESET_HB=(--reset-heartbeats)
+RESET_HB=()
 
-usage() { sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
@@ -35,7 +37,8 @@ while [[ $# -gt 0 ]]; do
     --workflow-id) WORKFLOW_ID="$2"; shift 2 ;;
     --compose-dir) COMPOSE_DIR="$2"; shift 2 ;;
     --unpause)     UNPAUSE="true"; shift ;;
-    --keep-heartbeats) RESET_HB=(); shift ;;
+    --reset-heartbeats) RESET_HB=(--reset-heartbeats); shift ;;
+    --keep-heartbeats) RESET_HB=(); shift ;;   # accepted for compatibility; now the default
     -h|--help)     usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac

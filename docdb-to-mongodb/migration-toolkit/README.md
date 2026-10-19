@@ -333,7 +333,12 @@ cd <prefix>/cdctest && cp .env.sample .env && ./run-cdc-test.sh T0|T1|T2|status|
 ```
 
 A constant non-zero `gap` (EventsRead − EventsWritten) means the writer is the
-bottleneck; a catch-up ratio below 1.0 means the stream is falling behind.
+bottleneck. A catch-up ratio below 1.0 means the stream is falling behind,
+but trust it only once `lsn-read` ≈ 0; while a backlog drains, read the lag.
+
+The test kit's `docker-compose.yml` is generated into the bundle by the fetch
+script (only `run-cdc-test.sh` and `.env.sample` live in `helpers/cdctest/`).
+`run-cdc-test.sh` also loads a `docker-compose.override.yml` placed next to it.
 
 ## Verify only
 

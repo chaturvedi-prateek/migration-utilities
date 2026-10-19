@@ -1060,8 +1060,14 @@ Clear all currently-paused activities in one shot:
 ```bash
 docker compose exec temporal temporal activity unpause \
   --query 'TemporalPauseInfo IS NOT NULL' --yes \
-  --reset-attempts --reset-heartbeats
+  --reset-attempts
 ```
+**Do not add `--reset-heartbeats`.** Per Adiom it discards the stored
+heartbeat, so the activity restarts from its *original* cursor: a CDC stream
+replays from the start of the run, and an initial-sync partition is re-copied.
+`--reset-attempts` alone resumes from the last heartbeat. The `--query` form
+may also miss activities paused inside child workflows; `dsync-find-pauses.sh`
+walks every child.
 
 Or target a single activity by ID (get the current ID from `activity list`
 above first — don't reuse an ID from an old log line, it may have been
@@ -1069,7 +1075,7 @@ rescheduled):
 ```bash
 docker compose exec temporal temporal activity unpause \
   --workflow-id <WORKFLOW_ID> --activity-id <ID> \
-  --reset-attempts --reset-heartbeats
+  --reset-attempts
 ```
 
 ### Silent pause via the dsynct web dashboard (`:8080`) — validated live, cost significant debugging time
@@ -1392,11 +1398,13 @@ moment and activity it happened to:
 ```bash
 docker compose logs worker | grep "activity paused"
 ```
-Fix — unpause and let it resume from where it left off (same command as §T2):
+Fix — unpause and let it resume from where it left off (same command as §T2;
+`--reset-attempts` only — `--reset-heartbeats` would restart the stream from
+its original cursor):
 ```bash
 docker compose exec temporal temporal activity unpause \
   --workflow-id <WORKFLOW_ID> --activity-id <ID> \
-  --reset-attempts --reset-heartbeats
+  --reset-attempts
 ```
 
 ### 2. Fresh workflow restarts can still hit CappedPositionLost/ChangeStreamHistoryLost repeatedly

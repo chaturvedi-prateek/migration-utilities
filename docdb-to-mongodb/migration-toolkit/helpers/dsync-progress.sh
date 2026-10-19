@@ -132,7 +132,7 @@ if [[ -n "$PAUSED" ]]; then
   echo
   warn "paused activities on ${WORKFLOW_ID:-<file>}:"
   echo "$PAUSED"
-  echo "  unpause: dsync-find-pauses.sh --unpause   (uses --reset-attempts --reset-heartbeats)"
+  echo "  unpause: dsync-find-pauses.sh --unpause   (uses --reset-attempts; resumes from the last heartbeat)"
 fi
 if [[ -n "$INTERVAL" ]]; then
   echo

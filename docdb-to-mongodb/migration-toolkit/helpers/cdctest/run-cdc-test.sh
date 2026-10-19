@@ -29,7 +29,13 @@ usage() { sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; }
 envget() { grep -E "^$1=" "$2" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
 # mongodb[+srv]://user:pw@host1,host2/db?opts -> host1,host2 (lower-case)
 hosts() { local u="${1#*://}"; u="${u##*@}"; u="${u%%/*}"; u="${u%%\?*}"; tr '[:upper:]' '[:lower:]' <<<"$u"; }
-compose() { docker compose -f "${HERE}/docker-compose.yml" "$@"; }
+# An explicit -f disables compose's auto-loading of docker-compose.override.yml,
+# so add it back when present (networks / port remaps for the test project).
+compose() {
+  local files=(-f "${HERE}/docker-compose.yml")
+  [[ -f "${HERE}/docker-compose.override.yml" ]] && files+=(-f "${HERE}/docker-compose.override.yml")
+  docker compose "${files[@]}" "$@"
+}
 
 TEST="${1:-}"
 case "$TEST" in

@@ -576,9 +576,9 @@ MDB_DEST=mongodb+srv://migration_user:PASSWORD@cluster.xxxxx.mongodb.net/?retryW
 
 # One queue per migration config. Never mix different source/dest/transform
 # configs on one queue — workers pull tasks interchangeably.
-QUEUE=dsync-prod-svoc
-WORKFLOW_ID=prod-svoc
-NAMESPACE=svoc-db
+QUEUE=dsync-<name>
+WORKFLOW_ID=<name>
+NAMESPACE=your-db
 
 # Scale knobs. Total concurrent partition copies is roughly
 # CONCURRENT_ACTIVITIES x worker replicas — raise until the source, Atlas, or
@@ -588,7 +588,7 @@ CONCURRENT_ACTIVITIES=4
 SYNC_WRITER_WORKERS=8
 PER_STREAM_WORKERS=4
 
-# 500000 is the documented floor for the large MSIL clusters. Lower it only if
+# 500000 is the recommended floor for very large clusters. Lower it only if
 # a few huge collections would otherwise not split into enough tasks to fill
 # the worker fleet.
 DOC_PARTITION=500000
@@ -628,8 +628,9 @@ SKIP_INITIAL_SYNC=false
 
 # --pause-on-error pauses an activity after this many failed attempts. 0
 # pauses on the first error, and a routine worker restart counts as one.
-# Always unpause with --reset-attempts (dsync-find-pauses.sh --unpause does
-# this, plus --reset-heartbeats). Paused activities show only on the CHILD
+# Always unpause with --reset-attempts ONLY (dsync-find-pauses.sh --unpause
+# does this). Never add --reset-heartbeats: it restarts the activity from its
+# original cursor (CDC replays from the start). Paused activities show only on the CHILD
 # workflow (e.g. <WORKFLOW_ID>/bulk-5), not on the parent.
 ATTEMPTS_BEFORE_PAUSE=3
 
