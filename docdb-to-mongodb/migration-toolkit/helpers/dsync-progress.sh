@@ -136,5 +136,7 @@ if [[ -n "$PAUSED" ]]; then
 fi
 if [[ -n "$INTERVAL" ]]; then
   echo
-  echo "catchup < 1.0 => stream falling behind; constant gap > 0 => writer-bound."
+  echo "legend (not a verdict): judge over many samples — lag_s growing / catchup"
+  echo "  persistently < 1.0 => falling behind; gap pinned at the same value => writer-bound;"
+  echo "  lsn-read <= 0 => reader at head (the LSN heartbeat is sampled less often)."
 fi

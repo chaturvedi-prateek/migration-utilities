@@ -258,6 +258,18 @@ activity in `status`, they are waiting for slots.
   with a stable lag over ≥ 30 minutes.
 - **Falls behind:** lag grows, ratio < 1.0, and a constant gap means
   writer-bound.
+- **Reading `dsync-progress.sh` samples:** judge the **trend over 10+
+  samples**, not one line. Even a healthy stream shows a lag of ~20–65 s, a
+  catch-up ratio swinging 0.7–1.5, and a gap moving between a few thousand
+  and ~30k. A **negative `lsn-read`** just means the reader is at the head:
+  the LSN heartbeat is sampled less often than the main stream's. The footer
+  is a legend, not a verdict.
+- **Reference result (production source, Oct 2026):** T0 with a shared stream
+  over 125 namespaces into `/dev/null`, at ~2.5k ev/s off-peak, **kept up**.
+  Average ~2.5k ev/s, peaks of ~3.5k ev/s while catching up after start-up,
+  lag steady at 21–65 s over 16 minutes. So dsynct can process a shared
+  stream above 3.5k ev/s when writes are free; the production ceiling comes
+  from the per-flush destination round trip.
 
 While each test runs, also record: source **replica** CPU (CloudWatch
 `DBInstanceIdentifier` of the instance the URI reads from), worker CPU and
