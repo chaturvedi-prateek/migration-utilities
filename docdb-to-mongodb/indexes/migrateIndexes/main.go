@@ -121,6 +121,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", true, "Print what would be done without applying changes (default: true)")
 	mode := flag.String("mode", "create", "'create' = pre-cutover  |  'rectify' = post-cutover TTL+unique fix  |  'verify' = compare source vs destination")
 	concurrency := flag.Int("concurrency", 8, "Max simultaneous index operations on the destination")
+	timeout := flag.Duration("timeout", 72*time.Hour, "Overall deadline for the whole run (e.g. 24h, 72h); 0 = no deadline. Index builds already started on the server keep running if it expires")
 	flag.Parse()
 
 	if *mode != "create" && *mode != "rectify" && *mode != "verify" {
@@ -140,8 +141,19 @@ func main() {
 		defer logCloser.Close()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+	// One deadline covers the whole run. Large estates need far more than a few
+	// hours: the server serializes builds per collection and caps concurrent
+	// builds (maxNumActiveUserIndexBuilds, default 3).
+	ctx := context.Background()
+	cancel := func() {}
+	if *timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+	}
 	defer cancel()
+	timeoutLabel := "none"
+	if *timeout > 0 {
+		timeoutLabel = timeout.String()
+	}
 
 	srcClient := mustConnect(ctx, cfg.SourceURI, "source", *concurrency)
 	defer srcClient.Disconnect(ctx)
@@ -153,8 +165,8 @@ func main() {
 	if *dryRun {
 		modeLabel = "DRY RUN — no changes will be written"
 	}
-	outf("\n%s\n  migrate-indexes  |  mode=%-8s  |  %s\n  Config: %s  |  Concurrency: %d\n%s\n",
-		ruler(70), *mode, modeLabel, *configFile, *concurrency, ruler(70))
+	outf("\n%s\n  migrate-indexes  |  mode=%-8s  |  %s\n  Config: %s  |  Concurrency: %d  |  Timeout: %s\n%s\n",
+		ruler(70), *mode, modeLabel, *configFile, *concurrency, timeoutLabel, ruler(70))
 
 	specs, err := collectIndexSpecs(ctx, srcClient, cfg.Databases)
 	if err != nil {
@@ -221,6 +233,11 @@ func runCmdRetry(ctx context.Context, db *mongo.Database, cmd bson.D) error {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err = db.RunCommand(ctx, cmd).Err(); err == nil || !isTransient(err) {
 			return err
+		}
+		// The run-wide deadline expired: retrying cannot succeed. Say so plainly
+		// instead of logging a misleading "[RETRY 1/5]".
+		if ctx.Err() != nil {
+			return fmt.Errorf("run deadline (--timeout) reached; a build already started on the server keeps running — check $currentOp, then re-run: %w", err)
 		}
 		if attempt == maxAttempts {
 			break

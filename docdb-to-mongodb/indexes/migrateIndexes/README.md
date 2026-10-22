@@ -108,6 +108,7 @@ Edit `config.json`:
 | `--mode` | `create` | `create` \| `verify` \| `rectify`. |
 | `--dry-run` | `true` | Preview without writing. Set `false` to apply. Ignored by `verify` (always read-only). |
 | `--concurrency` | `8` | Number of index operations run in parallel on the destination (also sizes the connection pool). See [Tuning parallelism](#tuning-parallelism). |
+| `--timeout` | `72h` | Overall deadline for the whole run (`24h`, `72h`, …); `0` = no deadline. Earlier versions hard-coded **6h**, too short for multi-TB collections. See [Many indexes fail with "context deadline exceeded"](#many-indexes-fail-with-context-deadline-exceeded). |
 
 ---
 
@@ -136,6 +137,40 @@ Notes:
 - The connection pool is sized to `--concurrency + 5` (headroom for the progress
   monitor); server-selection timeout is 5 minutes and transient errors are
   retried automatically.
+- The server also caps concurrent index builds (`maxNumActiveUserIndexBuilds`,
+  default **3**). Extra `createIndexes` calls wait for a free slot while holding
+  a connection, so `--concurrency` above ~3 mostly queues work. On a destination
+  that is also applying CDC writes, `--concurrency=3` is a sensible choice.
+
+### Many indexes fail with "context deadline exceeded"
+
+Symptom: the summary shows many `ERROR … createIndex …: context deadline
+exceeded` lines, and the retries show only `[RETRY 1/5]` (or, in this version,
+"run deadline (--timeout) reached"). The whole run shares one deadline
+(`--timeout`). When it expires, every build still waiting or running on the
+client side fails at once.
+
+What happened on the server: on MongoDB 4.4+, a build that had **already
+started** keeps running after the client gives up. Calls that were still
+**waiting for a build slot** never started. So:
+
+1. **Don't rerun immediately.** A `createIndexes` call for an index that is
+   still building waits for that build, ties up a slot, and can time out again.
+   List the builds in progress on the destination and wait for them to finish:
+   ```js
+   db.getSiblingDB("admin").aggregate([
+     { $currentOp: { allUsers: true } },
+     { $match: { $or: [ { "command.createIndexes": { $exists: true } }, { msg: /Index Build/ } ] } },
+     { $project: { ns: 1, msg: 1, progress: 1, secs_running: 1 } }
+   ])
+   ```
+2. Run `--mode=verify` to list what is still missing. Indexes created by this
+   tool show `PENDING` (unique → non-unique, TTL → MAX_INT) until `rectify`;
+   that is expected.
+3. Rerun `--mode=create --dry-run=false` with a long enough `--timeout`
+   (default `72h`) and `--concurrency=3`. `createIndexes` is idempotent:
+   indexes that already exist are a no-op.
+4. Prefer off-peak hours: builds compete with live CDC writes on the primary.
 
 ---
 
